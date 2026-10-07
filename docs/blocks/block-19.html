@@ -1,0 +1,270 @@
+<section class="block" id="block-19" data-block="19" data-title="Deploy stages">
+    <div class="bhead"><div class="bnum">19</div><div>
+      <div class="bl">Block 19 · DevSecOps &amp; scale</div>
+      <h2>Deploy stages — shipping the image</h2>
+      <p class="bgoal"><b>Goal:</b> take the exact image you scanned and push it to a running environment, verify it, and be able to roll back in one click.</p>
+    </div></div>
+
+    <h3><span class="hn">19.1</span> Deployment strategies (know these four)</h3>
+    <div class="grid2">
+      <div class="card"><h5>♻️ Recreate</h5><p>Stop old, start new. Simplest, has downtime. Fine for dev.</p></div>
+      <div class="card"><h5>🔄 Rolling</h5><p>Replace instances gradually. No downtime, both versions briefly live — your API must tolerate that.</p></div>
+      <div class="card"><h5>🔵🟢 Blue-Green</h5><p>Run the new stack beside the old, switch the proxy/router when healthy. Instant rollback by switching back.</p></div>
+      <div class="card"><h5>🐤 Canary</h5><p>Send 5–10% of traffic to the new version, watch metrics, then ramp to 100%. Best for risky changes.</p></div>
+    </div>
+
+    <h3><span class="hn">19.2</span> The deploy target (Docker Compose on a VM)</h3>
+    <div class="code" data-lang="yaml"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">yaml</span><span class="fn">jenkins/deploy/docker-compose.yml  (lives on the target server)</span><button class="copy">📋 Copy</button></div><pre><code>version: "3.8"
+services:
+  nodejs-app:
+    image: ${IMAGE_REPO}:${IMAGE_TAG}      # injected by the pipeline -- never edited by hand
+    container_name: nodejs-app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      NODE_ENV: production
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  python-app:
+    image: ${IMAGE_REPO}:${IMAGE_TAG}
+    container_name: python-app
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      PORT: 5000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ['PORT']+'/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s</code></pre></div>
+    <div class="tip"><span class="lbl"><span class="ic">🎯</span>The golden rule of deployment</span>
+    Deploy the <strong>same immutable artifact</strong> that passed tests and scans — referenced by digest or SHA tag, never rebuilt per environment. "Build once, deploy everywhere." Rebuilding for prod means prod is running code nobody tested.</div>
+
+    <h3><span class="hn">19.3</span> Deploying over SSH</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">sshagent + docker compose pull/up + health check</span><button class="copy">📋 Copy</button></div><pre><code>stage('Deploy') {
+    agent { label 'linux' }
+    when { branch 'main' }
+    steps {
+        sshagent(credentials: ['deploy-key']) {          // SSH key credential, not a password
+            sh """
+                ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} &lt;&lt;'REMOTE'
+                  set -e
+                  cd ${DEPLOY_PATH}
+                  export IMAGE_REPO=${IMAGE}
+                  export IMAGE_TAG=${GIT_SHA}
+
+                  docker compose pull                    # pull the exact scanned image
+                  docker compose up -d --remove-orphans  # rolling replace
+                  docker image prune -f
+
+                  # wait for the healthcheck to go green
+                  for i in \$(seq 1 30); do
+                    if curl -fsS http://localhost:${APP_PORT}/health; then
+                      echo "healthy after \${i}s"; exit 0
+                    fi
+                    sleep 2
+                  done
+                  echo "health check failed"; exit 1
+REMOTE
+            """
+        }
+    }
+}</code></pre></div>
+
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>Two SSH gotchas</span>
+    <ul style="margin:0;padding-left:20px">
+      <li><code>-o StrictHostKeyChecking=no</code> skips host verification. Convenient, but it removes MITM protection — for production, pre-populate <span class="path">known_hosts</span> for the deploy user instead.</li>
+      <li>The heredoc must be <code>&lt;&lt;'REMOTE'</code> (quoted) so the <strong>remote</strong> shell expands <code>$IMAGE_TAG</code>, not the local one. Unquoted heredocs are a classic source of "deployed the wrong tag".</li>
+    </ul></div>
+
+    <h3><span class="hn">19.4</span> Rollback</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">One-stage rollback using the previous successful build's tag</span><button class="copy">📋 Copy</button></div><pre><code>stage('Rollback on failure') {
+    agent { label 'linux' }
+    when { expression { currentBuild.currentResult == 'FAILURE' &amp;&amp; params.AUTO_ROLLBACK } }
+    steps {
+        script {
+            // lastSuccessfulBuild gives us the tag that was last known good
+            def prev = currentBuild.previousSuccessfulBuild
+            if (!prev) { error 'No previous successful build to roll back to' }
+            def prevTag = prev.description?.trim() ?: prev.number.toString()
+            echo "Rolling back to ${prevTag}"
+
+            sshagent(credentials: ['deploy-key']) {
+                sh """
+                    ssh ${DEPLOY_USER}@${DEPLOY_HOST} \
+                      "cd ${DEPLOY_PATH} &amp;&amp; IMAGE_TAG=${prevTag} docker compose up -d --remove-orphans"
+                """
+            }
+        }
+        // let people know it happened
+        currentBuild.description = "ROLLED BACK from ${env.GIT_SHA}"
+    }
+}</code></pre></div>
+
+    <h3><span class="hn">19.5</span> If you deploy to Kubernetes instead</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">The same stage, Kubernetes flavour</span><button class="copy">📋 Copy</button></div><pre><code>stage('Deploy to Kubernetes') {
+    agent { label 'linux' }
+    steps {
+        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+            sh """
+                kubectl set image deployment/nodejs-app \
+                        app=${IMAGE}:${GIT_SHA} --record -n ${params.ENV}
+                kubectl rollout status deployment/nodejs-app -n ${params.ENV} --timeout=180s
+            """
+        }
+    }
+    post {
+        failure {
+            withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                sh "kubectl rollout undo deployment/nodejs-app -n ${params.ENV}"
+            }
+        }
+    }
+}</code></pre></div>
+    <div class="info"><span class="lbl"><span class="ic">💡</span>Helm for real environments</span>
+    <code>helm upgrade --install nodejs-app ./chart --set image.tag=${GIT_SHA} --namespace ${ENV} --atomic --timeout 5m</code> — <code>--atomic</code> gives you automatic rollback on failure for free, which is why most teams prefer Helm over raw manifests.</div>
+
+    <h3><span class="hn">19.6</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>A deploy stage runs on <code>main</code> only and uses the SHA-tagged image.</li>
+      <li>The pipeline verifies <code>/health</code> after deployment and fails if it never becomes healthy.</li>
+      <li>Rollback path tested at least once (break the health check on purpose).</li>
+      <li>I can describe blue-green and canary, and when each is appropriate.</li>
+    </ul>
+
+    <h3><span class="hn">19.7</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>How does your pipeline deploy?</div><div class="a">A deploy stage gated by <code>when { branch 'main' }</code> (and often an approval). It SSHes to the target with an SSH-agent credential, runs <code>docker compose pull/up</code> using the exact SHA tag that passed the scans, waits for the health endpoint, and on failure rolls back to the previous successful build's tag. The image is built once and promoted — never rebuilt per environment.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>How would you implement blue-green deployment in Jenkins?</div><div class="a">Deploy the new version alongside the old on a different port or stack name, run health checks and smoke tests against it, then flip the load balancer or proxy target. Keep the old version running until the switch is verified, so rollback is just flipping back. In Kubernetes this is two deployments plus a service selector change; on VMs, two compose projects plus an nginx upstream swap.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>What's your rollback strategy?</div><div class="a">Every deployment references an immutable tag, so rollback means redeploying the previous successful build's tag — I read it from <code>currentBuild.previousSuccessfulBuild</code>. On Kubernetes <code>kubectl rollout undo</code> or Helm's <code>--atomic</code> does it automatically. Crucially, database migrations must be backward compatible, otherwise rollback is impossible.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>Why build once and promote, instead of building per environment?</div><div class="a">Building per environment means production runs an artifact that was never tested — a different dependency resolution, a different base image patch level. Promoting one immutable artifact makes "it worked in staging" meaningful and makes rollback deterministic.</div></div>
+    </div>
+
+<h3><span class="hn">19.8</span> Under the hood — the artifact lifecycle</h3>
+<figure><pre class="ascii">
+  BUILD 1   archiveArtifacts -&gt;  $JENKINS_HOME/jobs/&lt;job&gt;/builds/1/archive/**
+                                        │
+                                        │  fingerprinter records checksums
+                                        ▼
+                                  fingerprint DB  (file MD5 -&gt; builds)
+                                        │
+  BUILD 2   copyArtifacts(project:..,   │  "which build produced the file I have?"
+            selector: lastSuccessful()) ┘
+</pre>
+<figcaption>Figure 19.1 — Artifacts are stored on the controller; fingerprints let you trace a file back to the build that produced it.</figcaption></figure>
+<div class="warn"><span class="lbl"><span class="ic">⚠️</span>Artifacts are not a package manager</span>
+Jenkins stores artifacts on the controller's disk, forever, with no de-duplication. Using it as your long-term release store will fill <span class="path">$JENKINS_HOME</span> and slow down backups. For real releases, push to a registry or artifact repository (Nexus, Artifactory, S3, GitHub Releases) and use Jenkins artifacts for build-scoped evidence only.</div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Fingerprints and cross-job artifact reuse</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent { label 'linux' }
+    options {
+        // keep the controller healthy: only 20 builds' worth of artifacts
+        buildDiscarder(logRotator(
+            numToKeepStr: '40', artifactNumToKeepStr: '20'))
+    }
+    stages {
+        stage('Build') {
+            steps {
+                sh 'npm ci &amp;&amp; npm pack'
+                archiveArtifacts(
+                    artifacts: '*.tgz',
+                    fingerprint: true,          // enable traceability
+                    onlyIfSuccessful: true)
+            }
+        }
+        stage('Promote') {
+            when { branch 'main' }
+            steps {
+                // pull the exact artifact another job produced
+                copyArtifacts(
+                    projectName: 'nodejs-pipeline/main',
+                    selector: lastSuccessful(),
+                    filter: '*.tgz',
+                    target: 'incoming/')
+                sh 'ls -la incoming/'
+            }
+        }
+    }
+}</code></pre></div>
+
+<h3><span class="hn">19.9</span> Stash vs archive vs external store</h3>
+<div class="tw"><table>
+<thead><tr><th>Mechanism</th><th>Lives where</th><th>Survives the build?</th><th>Cost</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>stash</code>/<code>unstash</code></td><td>Compressed on the controller, deleted with the build</td><td>No</td><td>Very cheap</td><td>Passing files between stages/agents in one build</td></tr>
+<tr><td><code>writeFile</code> + workspace</td><td>Agent workspace</td><td>No</td><td>Free</td><td>Transient scratch files</td></tr>
+<tr><td><code>archiveArtifacts</code></td><td><span class="path">$JENKINS_HOME</span></td><td>Yes</td><td>Controller disk</td><td>Reports, packages, evidence</td></tr>
+<tr><td>Registry / Nexus / S3</td><td>External</td><td>Yes</td><td>External</td><td>Release artifacts, images, long-term retention</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">19.10</span> Lab — promote a build through environments</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 19.1 · Build once, promote the same artifact</span>
+The discipline that separates real CI/CD from "rebuild per environment":
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">One artifact, three environments</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent { label 'docker' }
+    parameters {
+        choice(name: 'TARGET_ENV', choices: ['staging', 'prod'], description: 'Where to deploy')
+        string(name: 'BUILD_TO_PROMOTE', defaultValue: '', description: 'Empty = this build')
+    }
+    environment { REGISTRY = 'https://index.docker.io/v1/' }
+    stages {
+        stage('Resolve image') {
+            steps {
+                script {
+                    if (params.BUILD_TO_PROMOTE?.trim()) {
+                        copyArtifacts(
+                            projectName: env.JOB_NAME,
+                            selector: specific(params.BUILD_TO_PROMOTE),
+                            filter: 'image-tag.txt')
+                        env.IMAGE_TAG = readFile('image-tag.txt').trim()
+                        echo "PROMOTING already-built image tag ${env.IMAGE_TAG}"
+                    } else {
+                        env.IMAGE_TAG = env.GIT_SHA
+                        writeFile file: 'image-tag.txt', text: env.IMAGE_TAG
+                        sh 'docker build -t $DOCKER_USER/app:$IMAGE_TAG .'
+                        archiveArtifacts artifacts: 'image-tag.txt', fingerprint: true
+                    }
+                }
+            }
+        }
+        stage('Deploy') { steps { sh "./deploy.sh ${params.TARGET_ENV} ${env.IMAGE_TAG}" } }
+    }
+    post { success { archiveArtifacts artifacts: 'deploy-*.log', allowEmptyArchive: true } }
+}</code></pre></div>
+Run it twice: once with an empty <code>BUILD_TO_PROMOTE</code> (builds and archives), then again with that build number (reuses the identical tag). Nothing is rebuilt — that is the whole point.</div>
+
+<h3><span class="hn">19.11</span> Retention policy that keeps the controller healthy</h3>
+<div class="tw"><table>
+<thead><tr><th>Setting</th><th>Recommended</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Builds to keep</td><td>30–50</td><td>Enough history for trends without unbounded growth</td></tr>
+<tr><td>Artifacts to keep</td><td>10–20</td><td>Artifacts dominate disk usage</td></tr>
+<tr><td>Keep builds with artifacts?</td><td>Only for release jobs</td><td>Otherwise it defeats the artifact limit</td></tr>
+<tr><td>Days to keep</td><td>90 for branches, forever for release pipelines</td><td>Compliance vs hygiene</td></tr>
+</tbody>
+</table></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Tiered retention: PR builds vs release builds</span><button class="copy">📋 Copy</button></div><pre><code>options {
+    buildDiscarder(logRotator(
+        numToKeepStr:         env.CHANGE_ID ? '10' : '50',   // PRs: short
+        artifactNumToKeepStr: env.CHANGE_ID ? '2'  : '20',
+        daysToKeepStr:        '90'))
+}</code></pre></div>
+
+<h3><span class="hn">19.12</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>How do you promote the same artifact through environments?</div><div class="a">Build once and record an immutable identifier (the git SHA or the image digest), then deploy that exact identifier to staging and production. Rebuilding per environment produces a different artifact, so what you tested is not what you shipped. Promotion reads the recorded identifier from the build's artifacts or from the registry.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>What is a fingerprint and why do you enable it?</div><div class="a">A checksum Jenkins records for an archived file. It lets you answer "which build produced this file?" and "which builds consumed it?" — essential for traceability and for <code>copyArtifacts</code> relationships between upstream and downstream jobs.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span><code>JENKINS_HOME</code> is 90% full. What do you do?</div><div class="a">Find the offenders with <code>du -sh /var/lib/jenkins/jobs/* | sort -h</code>, tighten the discard policies (especially artifact retention), clean old workspaces with <code>cleanWs</code>, and move real release artifacts to external storage. Then make it structural: a global discarder or JCasC defaults so new jobs inherit sane retention.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>How do you handle large binary artifacts (hundreds of MB)?</div><div class="a">Don't put them in Jenkins at all. Push to S3, Nexus, Artifactory or the container registry, and archive only a small manifest or a URL file. Jenkins artifacts are for reports and small packages; anything large belongs in a system designed for it.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q10</span>How do you keep artifacts after deleting the build?</div><div class="a">You can't — the archive lives under the build directory. If a build record is discarded, its artifacts go too. That's why anything with retention or compliance value must be copied to external storage inside the pipeline, in the same stage that archives it.</div></div>
+</div>
+</section>

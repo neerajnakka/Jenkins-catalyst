@@ -1,0 +1,350 @@
+<section class="block" id="block-7" data-block="7" data-title="Environment variables &amp; parameters">
+    <div class="bhead"><div class="bnum">07</div><div>
+      <div class="bl">Block 7 · Real engineering</div>
+      <h2>Environment variables &amp; build parameters</h2>
+      <p class="bgoal"><b>Goal:</b> control your pipeline's behaviour without editing code — the difference between a script that builds one thing and a pipeline a whole team can use.</p>
+    </div></div>
+
+    <h3><span class="hn">7.1</span> Three levels of environment variables</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Level</th><th>Where it's set</th><th>Scope</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>1. Global</strong></td><td>Manage Jenkins → System → <em>Global properties</em> → Environment variables</td><td>Every job on the controller</td><td>Company-wide things: <code>REGISTRY</code>, <code>SLACK_CHANNEL</code>, proxy settings</td></tr>
+        <tr><td><strong>2. Pipeline</strong></td><td><code>environment { }</code> in the Jenkinsfile</td><td>Every step in that pipeline (or one stage)</td><td><code>APP_NAME</code>, <code>IMAGE</code>, tool flags</td></tr>
+        <tr><td><strong>3. Step</strong></td><td><code>withEnv([...]) { }</code> or inline <code>sh 'VAR=x cmd'</code></td><td>Only inside that block</td><td>Temporary overrides, per-command config</td></tr>
+      </tbody>
+    </table></div>
+
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">All three in action</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+
+    environment {
+        APP_NAME   = 'nodejs-app'
+        IMAGE      = "docker.io/&lt;youruser&gt;/${APP_NAME}"   // variables can reference each other
+        BUILD_TS   = """${sh(returnStdout: true, script: 'date +%Y%m%d-%H%M%S').trim()}"""
+    }
+
+    stages {
+        stage('Demo') {
+            environment {
+                STAGE_ONLY = 'yes'                          // visible only in this stage
+            }
+            steps {
+                echo "Global? ${env.REGISTRY}"              // set in Manage Jenkins
+                echo "Pipeline: ${env.IMAGE} built at ${env.BUILD_TS}"
+                echo "Stage: ${env.STAGE_ONLY}"
+
+                withEnv(['NODE_ENV=ci', 'CI=true']) {        // block-scoped
+                    sh 'echo $NODE_ENV $CI'
+                }
+
+                sh 'INLINE=yes; echo $INLINE'               // per-command
+            }
+        }
+    }
+}</code></pre></div>
+
+    <h3><span class="hn">7.2</span> Built-in variables you must know</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Variable</th><th>Value</th><th>Typical use</th></tr></thead>
+      <tbody>
+        <tr><td><code>env.BUILD_NUMBER</code></td><td>42</td><td>Image tags, artifact versions</td></tr>
+        <tr><td><code>env.BUILD_ID</code></td><td>42 or timestamp</td><td>Legacy; prefer BUILD_NUMBER</td></tr>
+        <tr><td><code>env.BUILD_URL</code></td><td>Full URL of this build</td><td>Slack/email notifications</td></tr>
+        <tr><td><code>env.JOB_NAME</code> / <code>JOB_URL</code></td><td>Job identity</td><td>Notifications, dashboards</td></tr>
+        <tr><td><code>env.WORKSPACE</code></td><td>Absolute path of the workspace</td><td>Absolute paths in scripts</td></tr>
+        <tr><td><code>env.NODE_NAME</code> / <code>NODE_LABELS</code></td><td>Agent name / labels</td><td>Debug "which machine ran this?"</td></tr>
+        <tr><td><code>env.EXECUTOR_NUMBER</code></td><td>0, 1, …</td><td>Unique ports/volumes per concurrent build</td></tr>
+        <tr><td><code>env.BUILD_TAG</code></td><td><code>jenkins-${JOB_NAME}-${BUILD_NUMBER}</code></td><td>Unique container names</td></tr>
+        <tr><td><code>env.BRANCH_NAME</code></td><td>Branch (Multibranch only)</td><td>Branch-specific behaviour (Block 15)</td></tr>
+        <tr><td><code>env.CHANGE_ID</code></td><td>PR number (Multibranch PR builds)</td><td>PR comments &amp; checks</td></tr>
+        <tr><td><code>env.STAGE_NAME</code></td><td>Current stage</td><td>Dynamic log messages</td></tr>
+      </tbody>
+    </table></div>
+    <div class="tip"><span class="lbl"><span class="ic">🔍</span>See every variable on your own controller</span>
+    Open <span class="path">http://&lt;jenkins&gt;:8080/pipeline-syntax/globals</span> — it lists all built-ins with the real values your controller has right now. Or add a temporary stage: <code>sh 'env | sort'</code>.</div>
+
+    <h3><span class="hn">7.3</span> Parameters — inputs before the build starts</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Directive</th><th>UI widget</th><th>Read as</th></tr></thead>
+      <tbody>
+        <tr><td><code>string(name:'X', defaultValue:'…')</code></td><td>Text box</td><td><code>params.X</code> (String)</td></tr>
+        <tr><td><code>text(name:'X', defaultValue:'…')</code></td><td>Text area</td><td>String (multi-line)</td></tr>
+        <tr><td><code>booleanParam(name:'X', defaultValue:true)</code></td><td>Checkbox</td><td>Boolean</td></tr>
+        <tr><td><code>choice(name:'X', choices:['dev','qa','prod'])</code></td><td>Drop-down</td><td>String</td></tr>
+        <tr><td><code>password(name:'X', defaultValue:'…')</code></td><td>Masked box</td><td>String — avoid, use credentials (Block 8)</td></tr>
+        <tr><td><code>file(name:'X')</code></td><td>Upload</td><td>File in the workspace</td></tr>
+      </tbody>
+    </table></div>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Parameters + conditional behaviour</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+
+    parameters {
+        choice   name: 'ENV',        choices: ['dev', 'qa', 'prod'], description: 'Deploy target'
+        booleanParam name: 'RUN_TESTS',   defaultValue: true,  description: 'Run the unit test suite'
+        booleanParam name: 'PUSH_IMAGE',  defaultValue: false, description: 'Push to Docker Hub'
+        string   name: 'IMAGE_TAG',  defaultValue: '', description: 'Override tag (default: build number)'
+    }
+
+    environment {
+        // params is null on the very first build -> use the ?: fallback pattern
+        TAG = "${params.IMAGE_TAG ?: env.BUILD_NUMBER}"
+    }
+
+    stages {
+        stage('Test') {
+            when { expression { params.RUN_TESTS } }
+            steps { echo 'running tests' }
+        }
+        stage('Push') {
+            when {
+                allOf {
+                    expression { params.PUSH_IMAGE }
+                    anyOf { branch 'main'; expression { params.ENV == 'prod' } }
+                }
+            }
+            steps { echo "pushing tag ${env.TAG} to ${params.ENV}" }
+        }
+    }
+}</code></pre></div>
+
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>The first-build gotcha</span>
+    Parameters don't exist until the job has been built once — <code>params.RUN_TESTS</code> is <code>null</code> on build #1, so <code>when { expression { params.RUN_TESTS } }</code> is skipped. Always provide defaults and write <code>params.X ?: 'fallback'</code>. After the first build the "Build Now" button becomes "Build with Parameters".</div>
+
+    <h3><span class="hn">7.4</span> Credentials inside <code>environment{}</code> <small>(preview of Block 8)</small></h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">The credentials() helper</span><button class="copy">📋 Copy</button></div><pre><code>environment {
+    // Username/password  ->  *_USR and *_PSW
+    DOCKER = credentials('dockerhub-creds')        // DOCKER_USR, DOCKER_PSW
+
+    // Secret text        ->  variable holds the secret itself
+    SONAR_TOKEN = credentials('sonar-token')
+
+    // Secret file        ->  *_FILE (path to the temp file)
+    KUBECONFIG = credentials('kubeconfig-file')    // KUBECONFIG_FILE
+}</code></pre></div>
+
+    <h3><span class="hn">7.5</span> ✍️ Jenkinsfiles v7 — parameterized</h3>
+    <div class="tabs">
+      <div class="tabbar">
+        <button class="tab on" data-t="n7">🟩 nodejs-app/Jenkinsfile</button>
+        <button class="tab" data-t="p7">🐍 python-app/Jenkinsfile</button>
+      </div>
+      <div class="tabpane on" data-t="n7">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">nodejs-app/Jenkinsfile — v7</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+
+    parameters {
+        booleanParam name: 'RUN_TESTS', defaultValue: true,  description: 'Run Jest suite'
+        choice       name: 'LOG_LEVEL', choices: ['info','debug'], description: 'Shell verbosity'
+    }
+
+    options { timestamps(); timeout(time: 20, unit: 'MINUTES') }
+
+    environment {
+        APP_NAME        = 'nodejs-app'
+        npm_config_cache = '/var/lib/jenkins/.npm'
+        TAG             = "${env.BUILD_NUMBER}-${env.GIT_COMMIT_SHORT ?: 'nogit'}"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                dir(APP_NAME) { checkout scmGit(branches: [[name: '*/main']],
+                        extensions: [cleanBeforeCheckout()],
+                        userRemoteConfigs: [[credentialsId: 'github-ssh',
+                            url: 'git@github.com:&lt;you&gt;/jenkins-zero-to-hero.git']]) }
+                script {
+                    dir(APP_NAME) {
+                        env.GIT_COMMIT_SHORT = sh(script:'git rev-parse --short HEAD', returnStdout:true).trim()
+                    }
+                    echo "Build ${env.BUILD_NUMBER} · commit ${env.GIT_COMMIT_SHORT} · ${params.LOG_LEVEL}"
+                }
+            }
+        }
+        stage('Build') { steps { dir(APP_NAME) { sh 'npm ci' } } }
+        stage('Test')  {
+            when { expression { params.RUN_TESTS } }
+            steps { dir(APP_NAME) { sh 'npm run test:junit' } }
+        }
+    }
+
+    post {
+        always {
+            dir(APP_NAME) { junit testResults: 'reports/junit.xml', allowEmptyResults: true }
+            echo "Result: ${currentBuild.currentResult} · ${env.BUILD_URL}"
+        }
+    }
+}</code></pre></div>
+      </div>
+      <div class="tabpane" data-t="p7">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">python-app/Jenkinsfile — v7</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+
+    parameters {
+        booleanParam name: 'RUN_TESTS', defaultValue: true, description: 'Run pytest suite'
+        string       name: 'COVERAGE_MIN', defaultValue: '70', description: 'Coverage gate (%)'
+    }
+
+    options { timestamps(); timeout(time: 20, unit: 'MINUTES') }
+
+    environment {
+        APP_NAME      = 'python-app'
+        PIP_CACHE_DIR = '/var/lib/jenkins/.cache/pip'
+        VENV          = 'venv'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps { dir(APP_NAME) { checkout scmGit(branches: [[name: '*/main']],
+                        extensions: [cleanBeforeCheckout()],
+                        userRemoteConfigs: [[credentialsId: 'github-ssh',
+                            url: 'git@github.com:&lt;you&gt;/jenkins-zero-to-hero.git']]) } }
+        }
+        stage('Build') {
+            steps { dir(APP_NAME) { sh '''
+                        python3 -m venv $VENV
+                        . $VENV/bin/activate
+                        pip install --upgrade pip
+                        pip install -r requirements-dev.txt
+                    ''' } }
+        }
+        stage('Test') {
+            when { expression { params.RUN_TESTS } }
+            steps {
+                dir(APP_NAME) {
+                    sh ". $VENV/bin/activate &amp;&amp; pytest --cov-fail-under=${params.COVERAGE_MIN}"
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            dir(APP_NAME) { junit testResults: 'reports/junit.xml', allowEmptyResults: true }
+            echo "Result: ${currentBuild.currentResult} · ${env.BUILD_URL}"
+        }
+    }
+}</code></pre></div>
+      </div>
+    </div>
+
+    <h3><span class="hn">7.6</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>Added a global variable in Manage Jenkins and read it from a pipeline.</li>
+      <li>Both jobs now show "Build with Parameters" and honour the checkbox.</li>
+      <li>Printed the full environment with <code>sh 'env | sort'</code> once and recognised 10 built-ins.</li>
+      <li>I can explain the difference between <code>env.X</code> and <code>params.X</code>.</li>
+    </ul>
+
+    <h3><span class="hn">7.7</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>What's the difference between environment variables and parameters?</div><div class="a">Environment variables are values the pipeline sets or inherits and that steps read (<code>env.BUILD_NUMBER</code>, <code>REGISTRY</code>). Parameters are inputs supplied by the user (or API trigger) before the build starts, read via <code>params.X</code>, and declared in a <code>parameters</code> block. Parameters become environment variables too, but only they show up in the "Build with Parameters" UI.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>How do you pass a value from one stage to the next?</div><div class="a">Assign to <code>env</code> inside a <code>script</code> block: <code>env.VERSION = sh(script:'…', returnStdout:true).trim()</code>. Later stages read <code>env.VERSION</code>. Across <em>agents</em> I use <code>stash</code>/<code>unstash</code> or write a file, because the workspace isn't shared.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>Why would a parameterised stage be skipped on the first build?</div><div class="a">Because <code>params</code> is empty until the job has run once and Jenkins has materialised the parameter definitions. I guard with defaults: <code>params.X ?: 'fallback'</code>.</div></div>
+    </div>
+
+<h3><span class="hn">7.8</span> Under the hood — the three scopes in practice</h3>
+<p>Variables resolve in a predictable order, and knowing it saves you from "my variable is empty":</p>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">text</span><span class="fn">Precedence (later wins)</span><button class="copy">📋 Copy</button></div><pre><code>1. Jenkins built-ins          (BUILD_NUMBER, JOB_NAME, WORKSPACE …)
+2. Global properties          (Manage Jenkins -> System -> Global properties)
+3. environment { }  at pipeline level
+4. environment { }  at stage level      &lt;- overrides pipeline-level
+5. withEnv([...]) { }                   &lt;- overrides everything for that block
+6. inline shell:  VAR=x command         &lt;- only that command</code></pre></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Precedence demo</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+    environment { LOG = 'pipeline-level' }
+    stages {
+        stage('A') {
+            environment { LOG = 'stage-level' }
+            steps {
+                echo "1: ${env.LOG}"                    // stage-level
+                withEnv(['LOG=withEnv']) { echo "2: ${env.LOG}" }   // withEnv
+                sh 'echo "3: $LOG"'                     // stage-level again
+                sh 'LOG=inline; echo "4: $LOG"'         // inline
+            }
+        }
+        stage('B') {
+            steps { echo "5: ${env.LOG}" }              // pipeline-level
+        }
+    }
+}</code></pre></div>
+<div class="warn"><span class="lbl"><span class="ic">⚠️</span><code>env.X</code> vs <code>X</code></span>
+Inside <code>sh</code>, environment variables are shell variables (<code>$LOG</code>). In Groovy they're <code>env.LOG</code> or <code>LOG</code> — but plain <code>LOG</code> only works if Jenkins created it as a binding. Use <code>env.LOG</code> consistently; it is never ambiguous.</div>
+
+<h3><span class="hn">7.9</span> Parameter types in depth</h3>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Every parameter directive, with defaults and safe reads</span><button class="copy">📋 Copy</button></div><pre><code>parameters {
+    string(name: 'VERSION',   defaultValue: '1.0.0',  description: 'Semver to release')
+    text  (name: 'RELEASE_NOTES', defaultValue: '',   description: 'Markdown notes')
+    booleanParam(name: 'RUN_E2E',  defaultValue: false, description: 'Run the e2e suite')
+    choice(name: 'ENV', choices: ['dev','qa','prod'], description: 'Target environment')
+    password(name: 'API_KEY', defaultValue: '', description: 'Avoid — use credentials')
+    file  (name: 'CONFIG',    description: 'Upload a config file')
+}
+
+environment {
+    // Safe read pattern: params is empty on the very first build
+    TARGET  = "${params.ENV ?: 'dev'}"
+    E2E     = "${params.RUN_E2E != null ? params.RUN_E2E : false}"
+}</code></pre></div>
+<div class="tw"><table>
+<thead><tr><th>Type</th><th>Groovy type of <code>params.X</code></th><th>Gotcha</th></tr></thead>
+<tbody>
+<tr><td><code>string</code> / <code>text</code></td><td>String</td><td>Empty string, not null, when untouched</td></tr>
+<tr><td><code>booleanParam</code></td><td>Boolean</td><td><code>null</code> on the first build → use <code>!= false</code></td></tr>
+<tr><td><code>choice</code></td><td>String</td><td>Newlines in <code>choices</code> are trimmed; keep it a list</td></tr>
+<tr><td><code>password</code></td><td>String</td><td>Stored in build history — use credentials instead</td></tr>
+<tr><td><code>file</code></td><td>String (filename in workspace)</td><td>Uploaded per-build; not persisted</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">7.10</span> Lab — parameter-driven pipeline</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 7.1 · Build with Parameters</span>
+Add this to a scratch pipeline, run it once (creating the parameters), then run it again with different values and compare the log.
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Observe params vs env</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+    parameters {
+        choice name: 'ENV', choices: ['dev','qa','prod']
+        booleanParam name: 'VERBOSE', defaultValue: false
+    }
+    stages {
+        stage('Inspect') {
+            steps {
+                echo "params  = ${params}"
+                echo "ENV     = ${params.ENV}   (type: ${params.ENV.getClass().simpleName})"
+                echo "VERBOSE = ${params.VERBOSE}"
+                echo "as env  = ${env.ENV}"        // parameters are exported to env too
+                sh 'printenv | grep -E "^(ENV|VERBOSE)=" || true'
+            }
+        }
+        stage('Verbose only') {
+            when { expression { params.VERBOSE } }
+            steps { echo 'running extra diagnostics' }
+        }
+    }
+}</code></pre></div>
+Now trigger it from the API and confirm the parameters arrive:
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Trigger with parameters over HTTP</span><button class="copy">📋 Copy</button></div><pre><code>curl -X POST -u user:$TOKEN -H "$CRUMB" \
+  "$JENKINS_URL/job/scratch/buildWithParameters?ENV=qa&amp;VERBOSE=true"</code></pre></div>
+</div>
+
+<h3><span class="hn">7.11</span> Production notes</h3>
+<div class="tw"><table>
+<thead><tr><th>Practice</th><th>Reason</th></tr></thead>
+<tbody>
+<tr><td>Never put a secret in <code>parameters</code></td><td>Values are stored in plain text in build history and are visible to anyone with read access</td></tr>
+<tr><td>Provide a default for every parameter</td><td>API and upstream triggers may omit them</td></tr>
+<tr><td>Use <code>choice</code> over free text for environments</td><td>Prevents <code>prod</code> vs <code>production</code> typos reaching a deploy step</td></tr>
+<tr><td>Log the effective configuration at the start</td><td><code>echo "ENV=${params.ENV}"</code> makes post-mortems trivial</td></tr>
+<tr><td>Prefer the Active Choices plugin for dynamic lists</td><td>Fill choices from an API (e.g. list of available versions) instead of hard-coding</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">7.12</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q4</span>Are parameters available as environment variables?</div><div class="a">Yes — Jenkins exports parameters into the build environment, so <code>params.ENV</code> and <code>env.ENV</code> (and <code>$ENV</code> in shell) refer to the same value. The difference is that <code>params</code> is empty on the very first build before the definitions are materialised.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q5</span>How do you trigger a parameterised build from another pipeline?</div><div class="a"><code>build job: 'deploy', parameters: [string(name:'IMAGE_TAG', value: env.GIT_SHA)], wait: true, propagate: false</code> — then inspect <code>result.result</code> and decide whether to fail, mark unstable or continue.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q6</span>How do you pass a computed value from stage 1 to stage 3?</div><div class="a">Assign it to <code>env</code> inside a <code>script</code> block (<code>env.VERSION = …</code>). Later stages read <code>env.VERSION</code>. If the stages run on different agents I also <code>stash</code> the files, since the workspace isn't shared.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>How do you keep secrets out of parameters?</div><div class="a">I never use <code>password</code> parameters for real secrets — they're persisted in the build record. Secrets live in the credentials store and are bound with <code>withCredentials</code> at the moment of use.</div></div>
+</div>
+</section>

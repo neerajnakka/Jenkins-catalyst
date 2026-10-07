@@ -1,0 +1,38 @@
+# ---- Node ----
+node_modules/
+coverage/
+reports/
+*.log
+.env
+
+# ---- Python ----
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+htmlcov/
+coverage.xml
+.coverage
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- Local scratch ----
+*.local
+*.bak
+*.orig
+
+# ---- Secrets (never commit these) ----
+*.pem
+*.key
+id_rsa*
+.env*
+secrets/
+cosign.key
+
+# ---- Build output from the docs pipeline (the published guide IS committed) ----
+docs/_scratch/

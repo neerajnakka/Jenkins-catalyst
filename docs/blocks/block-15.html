@@ -1,0 +1,328 @@
+<section class="block" id="block-15" data-block="15" data-title="Multibranch Pipelines">
+    <div class="bhead"><div class="bnum">15</div><div>
+      <div class="bl">Block 15 · Real engineering</div>
+      <h2>Multibranch Pipelines</h2>
+      <p class="bgoal"><b>Goal:</b> one job definition that automatically builds every branch and pull request — with the Jenkinsfile living in the branch, so CI evolves with the code.</p>
+    </div></div>
+
+    <h3><span class="hn">15.1</span> What changes compared to a normal Pipeline job</h3>
+    <div class="tw"><table>
+      <thead><tr><th></th><th>Pipeline job</th><th>Multibranch Pipeline</th></tr></thead>
+      <tbody>
+        <tr><td>Jobs</td><td>One job, one branch (hard-coded)</td><td>One <em>folder</em>, auto-created sub-job per branch/PR</td></tr>
+        <tr><td>Branch</td><td>Fixed in job config</td><td>Discovered by scanning the repo</td></tr>
+        <tr><td>Jenkinsfile</td><td>Any path you name</td><td>In the repo root by default (configurable)</td></tr>
+        <tr><td>New branch</td><td>Someone creates a job by hand</td><td>Appears automatically on the next scan</td></tr>
+        <tr><td>Deleted branch</td><td>Job lingers forever</td><td>Removed by the orphaned-item strategy</td></tr>
+        <tr><td>PR validation</td><td>Manual setup</td><td>Built-in (Branch Source plugin)</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">15.2</span> Creating one (GitHub Branch Source)</h3>
+    <ol class="steps">
+      <li>Install <strong>GitHub Branch Source</strong> (<code>github-branch-source</code>).</li>
+      <li><em>New Item</em> → <strong>Multibranch Pipeline</strong> → name <code>app-pipeline</code>.</li>
+      <li><em>Branch Sources</em> → Add source → <strong>GitHub</strong> → Credentials: <code>github-pat</code> (needs a PAT, not SSH — it uses the API) → Repository HTTPS URL → Validate.</li>
+      <li><em>Behaviours</em> → add: <em>Discover branches</em> (all or "only branches that are also filed as PRs"), <em>Discover pull requests from origin</em> (merging the PR with the target branch), <em>Filter by name (with wildcards)</em> → <code>main develop feature/*</code>.</li>
+      <li><em>Build Configuration</em> → Mode: <em>by Jenkinsfile</em> → Script Path: <span class="path">nodejs-app/Jenkinsfile</span>.</li>
+      <li><em>Scan Repository Triggers</em> → tick <em>Periodically if not otherwise run</em> (e.g. 1 hour) and/or <em>Scan by webhook</em> with a trigger token.</li>
+      <li><em>Orphaned Item Strategy</em> → tick <em>Discard old items</em> → keep 5 (stops deleted branches leaving zombie jobs).</li>
+      <li>Save → <strong>Scan Repository Now</strong> → watch each branch become a job.</li>
+    </ol>
+
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>Script Path is per-multibranch-job, not per branch</span>
+    Since both apps live in one repo, create <strong>two</strong> multibranch jobs: <code>nodejs-pipeline</code> with Script Path <span class="path">nodejs-app/Jenkinsfile</span>, and <code>python-pipeline</code> with <span class="path">python-app/Jenkinsfile</span>. (A Jenkinsfile in the repo root is the common default; we keep them beside their app on purpose.)</div>
+
+    <h3><span class="hn">15.3</span> Branch-aware pipeline logic</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">env.BRANCH_NAME · when { branch } · changeRequest</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent none
+
+    stages {
+        stage('Info') {
+            agent { label 'linux' }
+            steps {
+                echo "Branch      : ${env.BRANCH_NAME}"     // 'main', 'feature/login', 'PR-42'
+                echo "Is PR build : ${env.CHANGE_ID ? 'yes' : 'no'}"
+                echo "PR target   : ${env.CHANGE_TARGET ?: 'n/a'}"
+                echo "Job name    : ${env.JOB_NAME}"        // 'app-pipeline/feature%2Flogin'
+            }
+        }
+
+        stage('Test') { /* always runs */ }
+
+        stage('Push image') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps { echo 'pushing image' }
+        }
+
+        stage('Deploy to prod') {
+            when {
+                allOf {
+                    branch 'main'
+                    not { changeRequest() }          // never deploy from a PR build
+                }
+            }
+            steps { echo 'deploying' }
+        }
+
+        stage('PR feedback') {
+            when { changeRequest() }                 // only for pull requests
+            steps {
+                echo "Validating PR #${env.CHANGE_ID} targeting ${env.CHANGE_TARGET}"
+                // Block 20: post the result back to the PR
+            }
+        }
+    }
+}</code></pre></div>
+
+    <div class="tw"><table>
+      <thead><tr><th>Variable</th><th>Branch build</th><th>PR build</th></tr></thead>
+      <tbody>
+        <tr><td><code>env.BRANCH_NAME</code></td><td><code>feature/login</code></td><td><code>PR-42</code></td></tr>
+        <tr><td><code>env.CHANGE_ID</code></td><td>unset</td><td><code>42</code></td></tr>
+        <tr><td><code>env.CHANGE_TARGET</code></td><td>unset</td><td><code>main</code></td></tr>
+        <tr><td><code>env.CHANGE_URL</code></td><td>unset</td><td>PR URL</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">15.4</span> Automating the scan (webhook for multibranch)</h3>
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">GitHub webhook for branch indexing</span><button class="copy">📋 Copy</button></div><pre><code># GitHub -> Settings -> Webhooks:
+#   Payload URL : http://&lt;JENKINS&gt;:8080/github-webhook/
+#   Content type: application/json
+#   Events      : Push, Pull request          &lt;-- PR needed for PR builds
+
+# In the multibranch job: Scan Repository Triggers -> "Scan by webhook"
+#   Trigger token: SCAN_ME   (or let the plugin generate one)
+
+# Test the scan endpoint manually:
+curl -X POST -u user:$TOKEN \
+  "http://&lt;JENKINS&gt;:8080/job/nodejs-pipeline/build?token=SCAN_ME"</code></pre></div>
+    <div class="note"><span class="lbl"><span class="ic">🔁</span>Indexing vs building</span>
+    A <strong>scan</strong> (indexing) asks GitHub "which branches/PRs exist?" and creates/updates/removes sub-jobs. A <strong>build</strong> runs a Jenkinsfile. A push webhook triggers both: scan first, then build the affected branch.</div>
+
+    <h3><span class="hn">15.5</span> Organization folders (enterprise scale)</h3>
+    <p><em>New Item → GitHub Organization</em> → point it at your GitHub org → Jenkins scans <strong>every repository</strong>, creates a multibranch job for each repo containing a Jenkinsfile, and keeps them in sync automatically. One configuration, hundreds of repos, zero manual job creation. This is what platform teams actually run.</p>
+
+    <h3><span class="hn">15.6</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>Two multibranch jobs exist and discover your branches.</li>
+      <li>Created a <code>feature/test-ci</code> branch, pushed, and saw a job appear automatically.</li>
+      <li>Deleted that branch, re-scanned, and watched the job disappear (orphaned strategy).</li>
+      <li>A PR build ran and printed <code>env.CHANGE_ID</code>.</li>
+      <li>The <code>Push image</code> stage is skipped on feature branches and runs on <code>main</code>.</li>
+    </ul>
+
+    <h3><span class="hn">15.7</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>What is a Multibranch Pipeline?</div><div class="a">A job that scans a repository and automatically creates a sub-pipeline for each branch or pull request that contains a Jenkinsfile. Branch discovery, PR validation and cleanup of deleted branches are handled by the Branch Source plugin instead of by humans creating jobs.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>How do you run different steps on different branches?</div><div class="a">With <code>when { branch 'main' }</code>, <code>when { changeRequest() }</code> and the environment variables <code>BRANCH_NAME</code>, <code>CHANGE_ID</code> and <code>CHANGE_TARGET</code>. Typically: tests on every branch, image push on <code>main</code>/<code>develop</code>, deployment only from <code>main</code> and never from a PR build.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>How do you stop deleted branches leaving dead jobs?</div><div class="a">Configure the multibranch job's <em>Orphaned Item Strategy</em> to discard old items after N days (or immediately). Otherwise every short-lived feature branch leaves a job behind forever.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>Why does Multibranch need <code>checkout scm</code> instead of a hard-coded branch?</div><div class="a">Because Jenkins injects the SCM configuration for whichever branch it is currently building. If I hard-code <code>main</code> in the Jenkinsfile, every branch build would check out <code>main</code> — so the feature branch would never actually be tested.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q5</span>Scanning found no branches — what do you check?</div><div class="a">The credentials (Multibranch uses the GitHub API, so it needs a PAT with <code>repo</code> scope), the repository URL, the behaviours (is branch discovery actually enabled?), and the Script Path — if the Jenkinsfile isn't at the configured path, the branch is detected but not built.</div></div>
+    </div>
+
+<h3><span class="hn">15.8</span> Under the hood — scanning and lightweight checkout</h3>
+<p>A Multibranch job is a <em>folder</em> that holds child jobs. The scan (indexing) does three things:</p>
+<ol class="steps">
+  <li><strong>Enumerate</strong> branches and pull requests via the Git provider API — which is why it needs a personal access token, not just an SSH key.</li>
+  <li><strong>Lightweight checkout</strong> — fetch each candidate's Jenkinsfile straight from the API, with no workspace and no executor, just to see whether the branch is buildable.</li>
+  <li><strong>Reconcile</strong> — create a child job per qualifying branch, update existing ones, and apply the orphaned-item strategy to remove dead ones.</li>
+</ol>
+<div class="warn"><span class="lbl"><span class="ic">⚠️</span>Lightweight checkout has a consequence</span>
+Because the Jenkinsfile is read via the API, its environment is <em>not</em> a full workspace. Anything that needs a real clone during evaluation — for example loading another file from the repo — fails at scan time. If you need that, disable lightweight checkout in the job's Branch Source behaviours.</div>
+
+<h3><span class="hn">15.9</span> Behaviours reference (Branch Source)</h3>
+<div class="tw"><table>
+<thead><tr><th>Behaviour</th><th>Effect</th><th>Use it when</th></tr></thead>
+<tbody>
+<tr><td><em>Discover branches</em></td><td>Find branches by strategy: all, excluding those filed as PRs, or only those filed as PRs</td><td>Always — pick "exclude PRs" if PRs are built separately</td></tr>
+<tr><td><em>Discover pull requests from origin</em></td><td>Build <code>PR-&lt;n&gt;</code> for open PRs, with a merge strategy</td><td>You want pre-merge validation</td></tr>
+<tr><td><em>Discover pull requests from forks</em></td><td>Build fork PRs, with a trust policy</td><td>Open-source or inner-source repos</td></tr>
+<tr><td><em>Filter by name (wildcards)</em></td><td>Include/exclude by pattern, e.g. <code>main develop feature/* release/*</code></td><td>Keep the folder readable</td></tr>
+<tr><td><em>Check out to matching local branch</em></td><td>Real local branch instead of detached HEAD</td><td>Pipelines that push tags back</td></tr>
+<tr><td><em>Clean after / before checkout</em></td><td><code>git clean -fdx</code> behaviour per branch</td><td>Stale artifacts causing mystery failures</td></tr>
+<tr><td><em>Orphaned item strategy</em></td><td>Delete child jobs for deleted branches, now or after N days</td><td>Always — otherwise zombie jobs accumulate</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">15.10</span> Lab — the full branch lifecycle</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 15.1 · Branch in, branch out</span>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Do this end to end and watch the folder change</span><button class="copy">📋 Copy</button></div><pre><code>git switch -c feature/multibranch-demo
+echo "# demo" &gt;&gt; README.md
+git commit -am "demo: multibranch branch"
+git push -u origin feature/multibranch-demo
+
+# In Jenkins: nodejs-pipeline -&gt; Scan Repository Now
+#   -&gt; a child job "feature%2Fmultibranch-demo" appears and builds
+
+git switch main
+git branch -d feature/multibranch-demo
+git push origin --delete feature/multibranch-demo
+
+# Scan again -&gt; the child job is removed (orphaned item strategy)
+# Check: job -&gt; Scan Repository Log  (shows exactly what was added/removed)</code></pre></div>
+<strong>Then:</strong> open a pull request that changes only <span class="path">python-app/</span> and confirm the Node pipeline still runs — it should, because we don't filter by path. Now add a name filter or a path-based <code>when</code> condition and see the difference.</div>
+
+<h3><span class="hn">15.11</span> Jenkinsfile patterns for branches and PRs</h3>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">A complete branch-aware policy</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent none
+
+    options {
+        // keep PR builds short-lived; keep release branches longer
+        buildDiscarder(logRotator(numToKeepStr: '50'))
+        timeout(time: 45, unit: 'MINUTES')
+    }
+
+    stages {
+        stage('Build')  { agent { label 'linux' };  steps { sh './build.sh' } }
+
+        stage('Test')   { agent { label 'linux' };  steps { sh './test.sh' } }
+
+        stage('Full security scans') {
+            when { not { changeRequest() } }      // full scans on branches, quick ones on PRs
+            steps { sh './scan.sh --full' }
+        }
+
+        stage('Push image') {
+            when { anyOf { branch 'main'; branch 'develop'; branch 'release/*' } }
+            steps { sh './push.sh' }
+        }
+
+        stage('Deploy') {
+            when {
+                allOf {
+                    branch 'main'
+                    not { changeRequest() }
+                }
+            }
+            steps { sh './deploy.sh' }
+        }
+    }
+
+    post {
+        always {
+            script {
+                // make the folder readable at a glance
+                currentBuild.description = changeRequest()
+                    ? "PR-${env.CHANGE_ID} -&gt; ${env.CHANGE_TARGET}"
+                    : "${env.BRANCH_NAME} - ${env.GIT_SHA}"
+            }
+        }
+    }
+}</code></pre></div>
+<div class="note"><span class="lbl"><span class="ic">📌</span>Note</span><code>options { }</code> is evaluated before the pipeline body, so calling <code>changeRequest()</code> inside it works only in recent Jenkins versions. If yours complains, move the conditional into the stages as shown above.</div>
+
+<h3><span class="hn">15.12</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>How do you build pull requests safely?</div><div class="a">Enable PR discovery with a trust policy: PRs from forks don't get credentials or write access, and I keep a separate, restricted credential scope for untrusted builds. PR builds run tests and scans but never deploy and never push images.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>What is the orphaned item strategy?</div><div class="a">The policy for child jobs whose branch no longer exists — discard immediately or after N days, optionally keeping build records. Without it, every short-lived feature branch leaves a permanent job behind.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>How do you report CI status back to a pull request?</div><div class="a">The GitHub Branch Source plugin reports build status to the PR automatically when the job is configured for it, and I add a <code>post</code> step to comment a summary. That status check is what lets branch protection require a green build before merge.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>Scanning is slow on a repo with 500 branches. What now?</div><div class="a">Filter by name so only active prefixes are discovered, increase the scan interval, prefer webhook-driven scanning over periodic scans, and prune stale branches in the repository itself. Scans cost API calls, so they are also subject to provider rate limits.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q10</span>How do you deploy a preview environment per pull request?</div><div class="a">Add a stage gated on <code>when { changeRequest() }</code> that deploys to a namespace or subdomain derived from <code>CHANGE_ID</code>, then tears it down in <code>post { cleanup }</code> or when the PR closes. Preview environments are the highest-value thing Multibranch enables.</div></div>
+</div>
+
+<h3><span class="hn">15.8</span> Under the hood — scanning and lightweight checkout</h3>
+<p>A Multibranch job is a <em>folder</em> that holds child jobs. The scan (indexing) does three things:</p>
+<ol class="steps">
+  <li><strong>Enumerate</strong> branches and pull requests via the Git provider API — which is why it needs a personal access token, not just an SSH key.</li>
+  <li><strong>Lightweight checkout</strong> — fetch each candidate's Jenkinsfile straight from the API, with no workspace and no executor, just to see whether the branch is buildable.</li>
+  <li><strong>Reconcile</strong> — create a child job per qualifying branch, update existing ones, and apply the orphaned-item strategy to remove dead ones.</li>
+</ol>
+<div class="warn"><span class="lbl"><span class="ic">⚠️</span>Lightweight checkout has a consequence</span>
+Because the Jenkinsfile is read via the API, its environment is <em>not</em> a full workspace. Anything that needs a real clone during evaluation — for example loading another file from the repo — fails at scan time. If you need that, disable lightweight checkout in the job's Branch Source behaviours.</div>
+
+<h3><span class="hn">15.9</span> Behaviours reference (Branch Source)</h3>
+<div class="tw"><table>
+<thead><tr><th>Behaviour</th><th>Effect</th><th>Use it when</th></tr></thead>
+<tbody>
+<tr><td><em>Discover branches</em></td><td>Find branches by strategy: all, excluding those filed as PRs, or only those filed as PRs</td><td>Always — pick "exclude PRs" if PRs are built separately</td></tr>
+<tr><td><em>Discover pull requests from origin</em></td><td>Build <code>PR-&lt;n&gt;</code> for open PRs, with a merge strategy</td><td>You want pre-merge validation</td></tr>
+<tr><td><em>Discover pull requests from forks</em></td><td>Build fork PRs, with a trust policy</td><td>Open-source or inner-source repos</td></tr>
+<tr><td><em>Filter by name (wildcards)</em></td><td>Include/exclude by pattern, e.g. <code>main develop feature/* release/*</code></td><td>Keep the folder readable</td></tr>
+<tr><td><em>Check out to matching local branch</em></td><td>Real local branch instead of detached HEAD</td><td>Pipelines that push tags back</td></tr>
+<tr><td><em>Clean after / before checkout</em></td><td><code>git clean -fdx</code> behaviour per branch</td><td>Stale artifacts causing mystery failures</td></tr>
+<tr><td><em>Orphaned item strategy</em></td><td>Delete child jobs for deleted branches, now or after N days</td><td>Always — otherwise zombie jobs accumulate</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">15.10</span> Lab — the full branch lifecycle</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 15.1 · Branch in, branch out</span>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Do this end to end and watch the folder change</span><button class="copy">📋 Copy</button></div><pre><code>git switch -c feature/multibranch-demo
+echo "# demo" &gt;&gt; README.md
+git commit -am "demo: multibranch branch"
+git push -u origin feature/multibranch-demo
+
+# In Jenkins: nodejs-pipeline -&gt; Scan Repository Now
+#   -&gt; a child job "feature%2Fmultibranch-demo" appears and builds
+
+git switch main
+git branch -d feature/multibranch-demo
+git push origin --delete feature/multibranch-demo
+
+# Scan again -&gt; the child job is removed (orphaned item strategy)
+# Check: job -&gt; Scan Repository Log  (shows exactly what was added/removed)</code></pre></div>
+<strong>Then:</strong> open a pull request that changes only <span class="path">python-app/</span> and confirm the Node pipeline still runs — it should, because we don't filter by path. Now add a name filter or a path-based <code>when</code> condition and see the difference.</div>
+
+<h3><span class="hn">15.11</span> Jenkinsfile patterns for branches and PRs</h3>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">A complete branch-aware policy</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent none
+
+    options {
+        // keep PR builds short-lived; keep release branches longer
+        buildDiscarder(logRotator(numToKeepStr: '50'))
+        timeout(time: 45, unit: 'MINUTES')
+    }
+
+    stages {
+        stage('Build')  { agent { label 'linux' };  steps { sh './build.sh' } }
+
+        stage('Test')   { agent { label 'linux' };  steps { sh './test.sh' } }
+
+        stage('Full security scans') {
+            when { not { changeRequest() } }      // full scans on branches, quick ones on PRs
+            steps { sh './scan.sh --full' }
+        }
+
+        stage('Push image') {
+            when { anyOf { branch 'main'; branch 'develop'; branch 'release/*' } }
+            steps { sh './push.sh' }
+        }
+
+        stage('Deploy') {
+            when {
+                allOf {
+                    branch 'main'
+                    not { changeRequest() }
+                }
+            }
+            steps { sh './deploy.sh' }
+        }
+    }
+
+    post {
+        always {
+            script {
+                // make the folder readable at a glance
+                currentBuild.description = changeRequest()
+                    ? "PR-${env.CHANGE_ID} -&gt; ${env.CHANGE_TARGET}"
+                    : "${env.BRANCH_NAME} - ${env.GIT_SHA}"
+            }
+        }
+    }
+}</code></pre></div>
+<div class="note"><span class="lbl"><span class="ic">📌</span>Note</span><code>options { }</code> is evaluated before the pipeline body, so calling <code>changeRequest()</code> inside it works only in recent Jenkins versions. If yours complains, move the conditional into the stages as shown above.</div>
+
+<h3><span class="hn">15.12</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>How do you build pull requests safely?</div><div class="a">Enable PR discovery with a trust policy: PRs from forks don't get credentials or write access, and I keep a separate, restricted credential scope for untrusted builds. PR builds run tests and scans but never deploy and never push images.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>What is the orphaned item strategy?</div><div class="a">The policy for child jobs whose branch no longer exists — discard immediately or after N days, optionally keeping build records. Without it, every short-lived feature branch leaves a permanent job behind.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>How do you report CI status back to a pull request?</div><div class="a">The GitHub Branch Source plugin reports build status to the PR automatically when the job is configured for it, and I add a <code>post</code> step to comment a summary. That status check is what lets branch protection require a green build before merge.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>Scanning is slow on a repo with 500 branches. What now?</div><div class="a">Filter by name so only active prefixes are discovered, increase the scan interval, prefer webhook-driven scanning over periodic scans, and prune stale branches in the repository itself. Scans cost API calls, so they are also subject to provider rate limits.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q10</span>How do you deploy a preview environment per pull request?</div><div class="a">Add a stage gated on <code>when { changeRequest() }</code> that deploys to a namespace or subdomain derived from <code>CHANGE_ID</code>, then tears it down in <code>post { cleanup }</code> or when the PR closes. Preview environments are the highest-value thing Multibranch enables.</div></div>
+</div>
+</section>

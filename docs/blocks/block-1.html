@@ -1,0 +1,391 @@
+<section class="block" id="block-1" data-block="1" data-title="Install Jenkins on EC2 &amp; master the UI">
+    <div class="bhead"><div class="bnum">01</div><div>
+      <div class="bl">Block 1 · Foundation</div>
+      <h2>Install Jenkins on EC2 &amp; master the UI</h2>
+      <p class="bgoal"><b>Goal:</b> own a real Jenkins controller and be able to name every menu in it. A pipeline you can't see running is a pipeline you can't debug.</p>
+    </div></div>
+
+    <h3><span class="hn">1.1</span> What Jenkins actually <em>is</em> — the 80% mental model</h3>
+    <p>Jenkins is an <strong>automation server</strong>: a Java application that runs jobs when something tells it to. Four words carry most of the interview:</p>
+
+    <div class="grid2">
+      <div class="card"><h5>🧠 Controller <small>(old name: master)</small></h5><p>The brain. Stores config, plugins, credentials, build history; serves the UI on port <code>8080</code>. <strong>In real companies it runs zero builds</strong> — it only orchestrates.</p></div>
+      <div class="card"><h5>💪 Agent <small>(old name: slave)</small></h5><p>The muscle. A machine (VM, container, pod) that connects to the controller and executes steps. Agents carry <strong>labels</strong> — <code>linux</code>, <code>docker</code>, <code>node20</code> — so you can route work.</p></div>
+      <div class="card"><h5>🎛️ Executor</h5><p>A <em>slot</em>. Two executors = two concurrent builds. "Pending — waiting for next available executor" simply means every slot is busy.</p></div>
+      <div class="card"><h5>📄 Jenkinsfile</h5><p>Your pipeline as <em>code</em>, committed beside the app. Versioned, reviewed in PRs, reusable. The heart of everything from Block 2 onward.</p></div>
+    </div>
+
+    <figure><pre class="ascii">
+                    ┌──────────────────────────────────────┐
+   you / GitHub ───▶│        JENKINS CONTROLLER            │
+     webhook        │   :8080  web UI  ·  JENKINS_HOME     │
+                    │   plugins · credentials · history    │
+                    └───────────────┬──────────────────────┘
+                                    │  assigns work by LABEL
+              ┌─────────────────────┼─────────────────────┐
+              ▼                     ▼                     ▼
+      ┌───────────────┐     ┌───────────────┐     ┌───────────────┐
+      │ AGENT  linux  │     │ AGENT  docker │     │ AGENT  python │
+      │ 2 executors   │     │ 4 executors   │     │ 2 executors   │
+      │ node20 · npm  │     │ docker.sock   │     │ py3.12 · venv │
+      └───────────────┘     └───────────────┘     └───────────────┘
+         builds run            images built          tests run
+         HERE                  HERE                  HERE</pre>
+    <figcaption>Figure 1.1 — The controller orchestrates; agents execute. One brain, many labelled muscles.</figcaption></figure>
+
+    <div class="info"><span class="lbl"><span class="ic">💡</span>Pipeline as Code — say this out loud in interviews</span>
+    Before 2016 you configured jobs by clicking (Freestyle). That config lived <em>only</em> inside Jenkins — lost in a crash, impossible to review, impossible to reuse. A <strong>Jenkinsfile</strong> moves the configuration into Git: versioned, reviewable, diffable, and enough to rebuild your whole CI from scratch. That shift is called <em>Pipeline as Code</em>, and it's why declarative pipeline syntax is the single most-asked Jenkins skill today.</div>
+
+    <h3><span class="hn">1.2</span> Sizing and securing your EC2 instance</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Choice</th><th>Recommended</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>AMI</td><td><strong>Ubuntu 24.04 LTS</strong></td><td>Best-documented Jenkins apt repo; matches most job descriptions.</td></tr>
+        <tr><td>Instance</td><td><code>t3.small</code> (2 GB) minimum · <code>t3.medium</code> (4 GB) recommended</td><td>Jenkins alone needs ~1 GB. Docker builds, Jest, pytest and later SonarQube push you past 2 GB quickly.</td></tr>
+        <tr><td>Storage</td><td><strong>30 GB gp3</strong></td><td><span class="path">/var/lib/jenkins</span> grows with every workspace, artifact and Docker layer. 8 GB fills in a week.</td></tr>
+        <tr><td>SSH</td><td>Key pair → log in as <code>ubuntu</code></td><td>Never enable password SSH, never use root.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h4>Security group rules</h4>
+    <div class="tw"><table>
+      <thead><tr><th>Port</th><th>Source</th><th>Purpose</th><th>Risk note</th></tr></thead>
+      <tbody>
+        <tr><td><code>22</code></td><td>My IP only</td><td>SSH administration</td><td><code>0.0.0.0/0</code> gets bot-scanned within minutes.</td></tr>
+        <tr><td><code>8080</code></td><td>My IP (learning)</td><td>Jenkins UI</td><td>Raw 8080 on the internet = unencrypted login. Block 12 replaces it with HTTPS + RBAC.</td></tr>
+        <tr><td><code>80/443</code></td><td><code>0.0.0.0/0</code> — only after Block 12</td><td>Nginx + Let's Encrypt</td><td>Open only once authentication is enforced.</td></tr>
+      </tbody>
+    </table></div>
+
+    <div class="warn"><span class="lbl"><span class="ic">💰</span>Cost reality check</span>
+    A <code>t3.medium</code> for 8 hours a day is roughly ₹500–700/month. <strong>Stop the instance when you're done</strong> — you keep the data and the Elastic IP, you just stop paying compute. Interviewers love hearing "I stopped my instance between sessions to control cost."</div>
+
+    <h3><span class="hn">1.3</span> The complete install script</h3>
+    <p>SSH in as <code>ubuntu</code> and run this. The comments are the lesson — read them. The file lives in your repo at <span class="path">jenkins/ec2-install.sh</span>.</p>
+
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">jenkins/ec2-install.sh</span><button class="copy">📋 Copy</button></div><pre><code>#!/usr/bin/env bash
+# =============================================================
+#  jenkins/ec2-install.sh -- Block 1
+#  Fresh Ubuntu 24.04 LTS EC2  ->  Jenkins LTS + Docker engine
+#  Usage:  bash ec2-install.sh
+# =============================================================
+set -euo pipefail                 # exit on error, unset var, pipe failure
+
+echo "### 1/7  Base packages + system update"
+sudo apt-get update -y &amp;&amp; sudo apt-get upgrade -y
+sudo apt-get install -y fontconfig ca-certificates curl gnupg git unzip jq
+
+echo "### 2/7  Java 21  (Jenkins LTS 2.4xx supports Java 17 and 21)"
+sudo apt-get install -y openjdk-21-jre-headless
+java -version                     # MUST print something like "openjdk 21.0.x"
+
+echo "### 3/7  Official Jenkins apt repository (keyring style, not apt-key)"
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key \
+     -o /etc/apt/keyrings/jenkins-keyring.asc
+echo "deb [signed-by=/etc/apt/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/" \
+  | sudo tee /etc/apt/sources.list.d/jenkins.list > /dev/null
+sudo apt-get update -y
+
+echo "### 4/7  Install Jenkins LTS and enable it at boot"
+sudo apt-get install -y jenkins
+sudo systemctl enable --now jenkins
+sleep 25
+sudo systemctl status jenkins --no-pager | head -5
+
+echo "### 5/7  Docker engine (needed from Block 9: build &amp; push)"
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release &amp;&amp; echo "$VERSION_CODENAME") stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update -y
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io \
+                        docker-buildx-plugin docker-compose-plugin
+
+echo "### 6/7  Let the 'jenkins' user build docker images (LEARNING SHORTCUT)"
+sudo usermod -aG docker jenkins
+sudo tee /etc/sudoers.d/jenkins > /dev/null &lt;&lt;'SUDO'
+jenkins ALL=(ALL) NOPASSWD:ALL
+SUDO
+sudo chmod 0440 /etc/sudoers.d/jenkins
+
+echo "### 7/7  Restart so the new group membership is picked up"
+sudo systemctl restart docker
+sudo systemctl restart jenkins
+sleep 20
+echo "=========================================================="
+echo " Unlock password  ->  paste this in the browser:"
+sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+echo "=========================================================="
+echo " Open:  http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):8080"</code></pre></div>
+
+    <div class="dang"><span class="lbl"><span class="ic">🚨</span>Read this before you run step 6/7</span>
+    <code>jenkins ALL=(ALL) NOPASSWD:ALL</code> lets the Jenkins user run <em>anything</em> as root without a password. Fine on a throwaway learning box; <strong>career-ending in production</strong>. Same for <code>usermod -aG docker jenkins</code> — docker group membership is effectively root. Block 9 covers the real options (Docker-in-Docker, rootless BuildKit, Kaniko, agent isolation) and Block 12 locks the controller down with RBAC.</div>
+
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">verify.sh — prove it works</span><button class="copy">📋 Copy</button></div><pre><code># Is Jenkins alive?
+sudo systemctl is-active jenkins                 # -&gt; active
+sudo ss -tlnp | grep 8080                        # -&gt; LISTEN  java
+
+# Can the jenkins user use docker? (the #1 thing that breaks in Block 9)
+sudo -u jenkins docker info --format '{{.ServerVersion}}'
+sudo -u jenkins docker run --rm hello-world      # must print "Hello from Docker!"
+
+# Where to look when it isn't
+sudo journalctl -u jenkins -n 100 --no-pager
+sudo tail -f /var/log/jenkins/jenkins.log
+
+# Toolchains for our two apps
+sudo apt-get install -y nodejs npm python3 python3-pip python3-venv
+node -v &amp;&amp; npm -v &amp;&amp; python3 -V</code></pre></div>
+
+    <h3><span class="hn">1.4</span> First boot: the setup wizard, click by click</h3>
+    <ol class="steps">
+      <li><strong>Unlock Jenkins.</strong> Open <span class="path">http://&lt;EC2-PUBLIC-IP&gt;:8080</span> and paste the password from <span class="path">/var/lib/jenkins/secrets/initialAdminPassword</span>. It exists only until setup finishes — that <em>is</em> the security model: prove you have filesystem access to the box.</li>
+      <li><strong>Customize Jenkins.</strong> Choose <strong>Select plugins to install</strong> (not "Install suggested") so you know exactly what you own. Use the list below.</li>
+      <li><strong>Create the first admin user.</strong> Never keep <code>admin</code> with the random password — Block 12 builds RBAC on top of <em>your</em> account.</li>
+      <li><strong>Instance Configuration.</strong> Leave the Jenkins URL as the public IP. If you later attach a domain, change it in <em>Manage Jenkins → System → Jenkins Location</em>.</li>
+      <li><strong>Start using Jenkins.</strong> You now have a controller.</li>
+    </ol>
+
+    <h4>Plugins to install now (everything else waits for its block)</h4>
+    <div class="tw"><table>
+      <thead><tr><th>Plugin</th><th>Why now</th><th>Priority</th></tr></thead>
+      <tbody>
+        <tr><td>Pipeline (workflow-aggregator)</td><td>Declarative + scripted engine. The core of everything.</td><td><span class="pill p-must">Must</span></td></tr>
+        <tr><td>Git</td><td>Checkout source from GitHub (Block 4).</td><td><span class="pill p-must">Must</span></td></tr>
+        <tr><td>Credentials + Credentials Binding</td><td>Store and inject secrets (Block 8).</td><td><span class="pill p-must">Must</span></td></tr>
+        <tr><td>Blue Ocean <em>(or Pipeline Graph View)</em></td><td>Pretty visualisation while learning.</td><td><span class="pill p-rec">Recommended</span></td></tr>
+        <tr><td>Pipeline: Stage View</td><td>Stage-by-stage status on the classic job page.</td><td><span class="pill p-rec">Recommended</span></td></tr>
+        <tr><td>Timestamper</td><td>Timestamps in the console log — priceless for slow stages.</td><td><span class="pill p-rec">Recommended</span></td></tr>
+        <tr><td>AnsiColor</td><td>Coloured npm/pytest output.</td><td><span class="pill p-opt">Optional</span></td></tr>
+        <tr><td>Build Timeout</td><td>Kill hung builds (Block 21).</td><td><span class="pill p-opt">Optional</span></td></tr>
+      </tbody>
+    </table></div>
+
+    <div class="tip"><span class="lbl"><span class="ic">⚡</span>Speed trick — make your controller reproducible</span>
+    The wizard is slow and un-repeatable. Keep <span class="path">jenkins/plugins.txt</span> updated every time a block adds a plugin, and you can rebuild the exact same controller with the Jenkins Plugin Installation Manager: <code>jenkins-plugin-cli --plugin-file plugins.txt</code>. Reproducibility is itself an interview answer to "how would you rebuild Jenkins after a disaster?"</div>
+
+    <h3><span class="hn">1.5</span> JENKINS_HOME — where everything actually lives</h3>
+    <p>Default: <span class="path">/var/lib/jenkins</span>. "Where does Jenkins store X?" is a guaranteed fresher question.</p>
+    <div class="tw"><table>
+      <thead><tr><th>Path</th><th>Holds</th><th>Deletable?</th></tr></thead>
+      <tbody>
+        <tr><td><span class="path">jobs/&lt;job&gt;/</span></td><td>Job config (<span class="path">config.xml</span>) + build history</td><td>❌ That's your entire CI.</td></tr>
+        <tr><td><span class="path">workspace/&lt;job&gt;/</span></td><td>Checked-out code from the last run</td><td>✅ Recreated on the next build — first fix for weird errors.</td></tr>
+        <tr><td><span class="path">plugins/</span></td><td>Installed <span class="path">.jpi</span> files</td><td>❌ Controller won't boot the same.</td></tr>
+        <tr><td><span class="path">secrets/</span></td><td>Master key + hashed credentials</td><td>❌ Lose it and every secret is unreadable.</td></tr>
+        <tr><td><span class="path">nodes/</span></td><td>Agent definitions</td><td>❌</td></tr>
+        <tr><td><span class="path">/var/log/jenkins/jenkins.log</span></td><td>Controller log</td><td>✅ Rotate freely.</td></tr>
+        <tr><td><span class="path">config.xml</span></td><td>Global configuration</td><td>❌</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">1.6</span> The UI, screen by screen</h3>
+    <figure><pre class="ascii">
+┌────────────────────────────────────────────────────────────────────────────┐
+│ #  Jenkins  ▸ New Item   ▾                      [user ▾] [🔔] [⚙ Manage]  │  ← breadcrumb + global actions
+├───────────────┬────────────────────────────────────────────────────────────┤
+│ SIDEBAR       │  Welcome to Jenkins!                                       │
+│               │                                                            │
+│ New Item      │  ┌──────────────────────────────────────────────────────┐  │
+│ People        │  │ Name        │ Last Success │ Last Failure │ Last Dur │  │
+│ Build History │  ├──────────────────────────────────────────────────────┤  │
+│ Manage Jenkins│  │ nodejs-app  │  #12  4m ago │  #9  2d ago  │   1m 20s │  │
+│ My Views      │  │ python-app  │  #5   1h ago │   -          │   0m 48s │  │
+│               │  └──────────────────────────────────────────────────────┘  │
+│  BUILD QUEUE  │  ● success   ● unstable   ● failed   ● aborted   ○ disabled│
+│  (executors)  │                                                            │
+└───────────────┴────────────────────────────────────────────────────────────┘</pre>
+    <figcaption>Figure 1.2 — Dashboard: global sidebar + job list + build queue / executor status.</figcaption></figure>
+
+    <h4>Manage Jenkins — the menu interviewers expect you to know</h4>
+    <div class="tw"><table>
+      <thead><tr><th>Section</th><th>What you do there</th><th>Block</th></tr></thead>
+      <tbody>
+        <tr><td><strong>System</strong></td><td>Jenkins URL, # executors, global env vars, email/Slack/GitHub server config</td><td>7, 20</td></tr>
+        <tr><td><strong>Tools</strong></td><td>Auto-installers for JDK / NodeJS / Python / Maven / Git — named tools referenced by <code>tools{}</code></td><td>13</td></tr>
+        <tr><td><strong>Plugins</strong></td><td>Install, update, downgrade. Always tick "restart when no jobs are running"</td><td>each</td></tr>
+        <tr><td><strong>Nodes and Clouds</strong></td><td>Add agents, set labels &amp; executors, cloud auto-scaling</td><td>13</td></tr>
+        <tr><td><strong>Credentials</strong> <small>(under Security)</small></td><td>The vault: username/password, SSH keys, secret text/file, certificates</td><td>8</td></tr>
+        <tr><td><strong>Users</strong> <small>(under Security)</small></td><td>Create/delete local users</td><td>12</td></tr>
+        <tr><td><strong>Security</strong></td><td>Authorization strategy (RBAC), CSRF, agent→controller access, script approval</td><td>12</td></tr>
+        <tr><td><strong>Script Console</strong></td><td>Run Groovy against the live controller. Powerful and dangerous.</td><td>22</td></tr>
+        <tr><td><strong>System Log</strong></td><td>Live log levels per subsystem</td><td>23</td></tr>
+        <tr><td><strong>Reload Configuration from Disk</strong></td><td>Re-read <span class="path">config.xml</span> after editing it on disk</td><td>22</td></tr>
+      </tbody>
+    </table></div>
+
+    <h4>Inside a job</h4>
+    <div class="tw"><table>
+      <thead><tr><th>Link</th><th>Use it to</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Build Now</strong></td><td>Trigger manually — you'll click this 300 times while learning.</td></tr>
+        <tr><td><strong>Configure</strong></td><td>For pipelines this is <em>only</em> "where is the Jenkinsfile"; all logic lives in Git.</td></tr>
+        <tr><td><strong>Console Output</strong></td><td>The raw log. 90% of debugging happens here.</td></tr>
+        <tr><td><strong>Pipeline Syntax</strong></td><td>⭐ Snippet Generator + Declarative Directive Generator. Block 3 is dedicated to it.</td></tr>
+        <tr><td><strong>Replay</strong></td><td>Edit and rerun a Jenkinsfile <em>without committing</em> — the fastest iteration loop in Jenkins.</td></tr>
+        <tr><td><strong>Workspace</strong></td><td>Browse the files on disk for that job.</td></tr>
+        <tr><td><strong>Blue Ocean / Graph View</strong></td><td>Visual stage graph, per-stage logs, rerun a single failed stage.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">1.7</span> Your first job — Freestyle (10 minutes, then we abandon it forever)</h3>
+    <ol class="steps">
+      <li><em>New Item</em> → name <strong>hello-freestyle</strong> → <em>Freestyle project</em> → OK.</li>
+      <li><em>Build Steps</em> → <em>Execute shell</em> → paste the three lines below → <em>Save</em> → <em>Build Now</em> → click <strong>#1</strong> → <strong>Console Output</strong>.</li>
+    </ol>
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Execute shell (freestyle build step)</span><button class="copy">📋 Copy</button></div><pre><code>echo "Hello from $(whoami) on $(hostname)"
+echo "Workspace: $(pwd)"
+ls -la</code></pre></div>
+    <p>Learn to read the output — the same shape appears in every pipeline log:</p>
+    <div class="code" data-lang="log"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">console</span><span class="fn">Console Output — hello-freestyle #1</span><button class="copy">📋 Copy</button></div><pre><code>Started by user yourname
+Running as SYSTEM                          &lt;-- which account runs it (Block 12 changes this)
+Building in workspace /var/lib/jenkins/workspace/hello-freestyle
+[hello-freestyle] $ /bin/sh -xe /tmp/jenkins123456.sh
++ echo Hello from jenkins on ip-172-31-1-10
+Hello from jenkins on ip-172-31-1-10
++ echo Workspace: /var/lib/jenkins/workspace/hello-freestyle
+Workspace: /var/lib/jenkins/workspace/hello-freestyle
++ ls -la
+total 8
+drwxr-xr-x 2 jenkins jenkins 4096 Oct  6 10:12 .
+Finished: SUCCESS</code></pre></div>
+    <ul>
+      <li><code>+ echo …</code> comes from the <code>-xe</code> flags: <strong>x</strong> prints each command (trace), <strong>e</strong> exits at the first failure. That's why one failing command stops the build.</li>
+      <li>Every step runs inside the <strong>workspace</strong> directory, as the <strong>jenkins</strong> OS user.</li>
+      <li>Terminal states are <code>SUCCESS</code>, <code>FAILURE</code>, <code>UNSTABLE</code>, <code>ABORTED</code>. Block 11 wires behaviour to each one.</li>
+    </ul>
+
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>Why we abandon Freestyle after this</span>
+    Freestyle config lives only in the Jenkins UI: no history, no review, no reuse, one server = one copy, and complex logic becomes a wall of checkboxes. It survives for tiny maintenance jobs, but <strong>every interview question assumes pipelines</strong>. From Block 2 we write Jenkinsfiles and never look back.</div>
+
+    <h3><span class="hn">1.8</span> Linux users, groups &amp; permissions <small>(interview favourite)</small></h3>
+    <p>Jenkins runs as the OS user <code>jenkins</code>. Almost every beginner error is a permissions error wearing a disguise.</p>
+    <div class="tw"><table>
+      <thead><tr><th>Command</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>sudo -u jenkins &lt;cmd&gt;</code></td><td>Run as the jenkins user — the #1 debugging move. If it fails here, it will fail in the pipeline.</td></tr>
+        <tr><td><code>id jenkins</code></td><td>Show uid/gid/groups. Is <code>docker</code> in the list?</td></tr>
+        <tr><td><code>sudo usermod -aG docker jenkins</code></td><td>Add jenkins to docker. <code>-a</code> = append — without it you wipe the other groups.</td></tr>
+        <tr><td><code>sudo chown -R jenkins:jenkins /path</code></td><td>Fix "Permission denied" on a directory.</td></tr>
+        <tr><td><code>chmod 600 ~/.ssh/id_ed25519</code></td><td>SSH keys must be owner-readable only or ssh refuses them. Critical in Blocks 4 and 13.</td></tr>
+        <tr><td><code>ls -l /var/run/docker.sock</code></td><td>Should be <code>root:docker</code>. If jenkins isn't in that group → the classic "permission denied while trying to connect to the Docker daemon socket".</td></tr>
+      </tbody>
+    </table></div>
+
+    <div class="intv"><span class="lbl"><span class="ic">🎤</span>Interview question you will get</span>
+    <b>Q. Your pipeline says "permission denied" but the identical command works in your terminal. Why?</b><br/>
+    Because I ran it as <code>ubuntu</code> and Jenkins runs it as <code>jenkins</code>. I reproduce exactly what Jenkins sees with <code>sudo -u jenkins &lt;command&gt;</code>, then fix ownership or group membership — for example adding jenkins to the <code>docker</code> group and restarting the service so the new group is loaded.</div>
+
+    <h3><span class="hn">1.9</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>Jenkins reachable at <span class="path">http://&lt;ip&gt;:8080</span> and it survives a reboot.</li>
+      <li>Logged in as <strong>my own</strong> admin user, not the default one.</li>
+      <li><code>sudo -u jenkins docker run --rm hello-world</code> prints "Hello from Docker!"</li>
+      <li><code>node -v</code>, <code>npm -v</code>, <code>python3 -V</code> all work on the box.</li>
+      <li>Ran <strong>hello-freestyle</strong> and read its console output end to end.</li>
+      <li>I can explain controller / agent / executor / workspace / Jenkinsfile without notes.</li>
+    </ul>
+
+    <h3><span class="hn">1.10</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>Difference between Jenkins controller and agent?</div><div class="a">The controller stores configuration, plugins, credentials and history, and decides <em>what</em> runs <em>where</em>. Agents execute the actual steps. Best practice is to set the controller's executors to <strong>0</strong> so a heavy build can never take the UI down (Block 13).</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>What is an executor?</div><div class="a">A slot that runs one build at a time. Two executors = two concurrent builds on that node. "Waiting for next available executor" means all slots are busy — fix by adding executors on that agent or more agents sharing the label.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>Where does Jenkins store its data?</div><div class="a">In <span class="path">JENKINS_HOME</span>, default <span class="path">/var/lib/jenkins</span>: jobs, workspaces, plugins, secrets, nodes and <span class="path">config.xml</span>. Backing up that directory plus your Jenkinsfiles (which live in Git) is a complete disaster-recovery plan.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>Freestyle vs Pipeline?</div><div class="a">Freestyle is UI-configured and not version-controlled; hard to review or reuse. Pipeline is code in a Jenkinsfile: stored in Git, reviewable, reusable via shared libraries, and supports parallel, retry, approvals and Docker agents. Pipeline is the standard.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q5</span>Which Java version does modern Jenkins need?</div><div class="a">Jenkins 2.463+ requires Java 17 or 21 (21 recommended); older 2.3xx ran on Java 11. Verify with <em>Manage Jenkins → System Information → java.version</em>.</div></div>
+    </div>
+
+    <h3><span class="hn">1.11</span> 🔥 Common errors</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td>Browser times out on :8080</td><td>Security group blocks 8080 from your IP</td><td>Add inbound rule 8080 (My IP); check <code>systemctl is-active jenkins</code></td></tr>
+        <tr><td>"Please wait while Jenkins is getting ready" forever</td><td>Still starting, or too little RAM</td><td>Wait 2 min; <code>journalctl -u jenkins -f</code>; move to t3.medium</td></tr>
+        <tr><td>"permission denied while trying to connect to the Docker daemon socket"</td><td>jenkins not in docker group, or no restart after <code>usermod</code></td><td><code>usermod -aG docker jenkins</code> then <code>systemctl restart jenkins</code> (groups load at login)</td></tr>
+        <tr><td><code>java: command not found</code></td><td>Java 21 missing</td><td><code>apt install openjdk-21-jre-headless</code></td></tr>
+        <tr><td>"No space left on device"</td><td>Workspaces + Docker layers + old build records</td><td><code>docker system prune -a</code>; enable discard-old-builds (Block 22)</td></tr>
+        <tr><td><code>initialAdminPassword</code> file missing</td><td>Setup already completed once</td><td>Log in with the user you created, or reset per Block 22</td></tr>
+      </tbody>
+    </table></div>
+
+<h3><span class="hn">1.12</span> Under the hood — what happens when Jenkins boots</h3>
+<p>Knowing the startup sequence turns "Jenkins won't start" from panic into a three-minute diagnosis.</p>
+<ol class="steps">
+  <li><strong>systemd launches the JVM.</strong> <span class="path">/usr/lib/systemd/system/jenkins.service</span> runs the WAR with the options in <span class="path">/etc/default/jenkins</span>. That file is where <code>JAVA_ARGS</code> lives — heap size, timezone, CSP settings.</li>
+  <li><strong>JENKINS_HOME is resolved</strong> (default <span class="path">/var/lib/jenkins</span>). If it doesn't exist, Jenkins creates it and runs the setup wizard.</li>
+  <li><strong>The secret store is unlocked</strong> with <span class="path">secrets/master.key</span>. If the key is missing, Jenkins generates a fresh one — which silently makes every existing credential undecryptable.</li>
+  <li><strong>Plugins load</strong> from <span class="path">plugins/*.jpi</span> in dependency order. One incompatible plugin can stall the whole boot, which is why you update plugins <em>before</em> upgrading core.</li>
+  <li><strong>Configuration is deserialised.</strong> Jenkins persists objects as XML with <strong>XStream</strong>: <span class="path">config.xml</span> is literally a serialised Java object graph. That's why hand-editing works, and why a malformed edit stops the boot.</li>
+  <li><strong>Agents reconnect</strong> over the <em>remoting</em> protocol (inbound TCP or SSH) and the queue is rebuilt from disk.</li>
+</ol>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">/etc/default/jenkins — the lines that matter</span><button class="copy">📋 Copy</button></div><pre><code># Heap + headless + timezone. 2-4 GB on a real controller.
+JAVA_ARGS="-Xmx2048m -Djava.awt.headless=true -Duser.timezone=Asia/Kolkata"
+JENKINS_HOME=/var/lib/jenkins
+JENKINS_ARGS="--httpListenAddress=127.0.0.1 --httpPort=8080"   # once a proxy is in front</code></pre></div>
+
+<h3><span class="hn">1.13</span> Lab — break it, then fix it</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 1.1 · The unbootable controller</span>
+<strong>Break it:</strong>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Cause a controlled outage</span><button class="copy">📋 Copy</button></div><pre><code>sudo cp /var/lib/jenkins/config.xml /tmp/config.xml.bak
+sudo sed -i '/&lt;\/hudson&gt;/d' /var/lib/jenkins/config.xml     # delete the closing tag
+sudo systemctl restart jenkins
+sudo journalctl -u jenkins -n 40 --no-pager                 # read the XStream parse error
+sudo ss -tlnp | grep 8080                                    # nothing listening -> it is down</code></pre></div>
+<strong>Fix it:</strong> <code>sudo cp /tmp/config.xml.bak /var/lib/jenkins/config.xml &amp;&amp; sudo systemctl restart jenkins</code>
+<br/><br/><strong>What you learned:</strong> every configuration change is a file change; a backup is just a file copy; the log always names the offending XML element.</div>
+
+<h3><span class="hn">1.14</span> Production notes — TLS and a reverse proxy</h3>
+<p>Raw <code>:8080</code> is fine while learning. The moment anyone else uses the controller, terminate TLS and hide the port:</p>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">nginx</span><span class="fn">/etc/nginx/sites-available/jenkins</span><button class="copy">📋 Copy</button></div><pre><code>upstream jenkins {
+    keepalive 32;
+    server 127.0.0.1:8080;                       # Jenkins stays on localhost
+}
+server {
+    listen 80;
+    server_name jenkins.example.com;
+    return 301 https://$host$request_uri;
+}
+server {
+    listen 443 ssl http2;
+    server_name jenkins.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/jenkins.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/jenkins.example.com/privkey.pem;
+
+    proxy_set_header Host              $host;               # Jenkins needs its public URL
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    location / {
+        proxy_pass         http://jenkins;
+        proxy_read_timeout 300s;      # long console streams
+        proxy_buffering    off;       # live console output
+    }
+}</code></pre></div>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Certificate + switchover</span><button class="copy">📋 Copy</button></div><pre><code>sudo apt-get install -y nginx certbot python3-certbot-nginx
+sudo certbot --nginx -d jenkins.example.com
+# add --httpListenAddress=127.0.0.1 to JENKINS_ARGS, then:
+sudo systemctl restart jenkins nginx
+# Manage Jenkins -> System -> Jenkins Location -> https://jenkins.example.com/</code></pre></div>
+<div class="warn"><span class="lbl"><span class="ic">⚠️</span>Two proxy gotchas that cost hours</span>
+If <em>Jenkins Location URL</em> still says <code>http://…:8080</code>, GitHub webhooks and agent JNLP files point at the wrong address. And without <code>proxy_buffering off</code> the live console log appears frozen until the build ends.</div>
+
+<h3><span class="hn">1.15</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>How do you put Jenkins behind HTTPS?</div><div class="a">Run Nginx as a reverse proxy with a Let's Encrypt certificate, bind Jenkins to <code>127.0.0.1:8080</code>, forward <code>X-Forwarded-*</code>, disable proxy buffering so the console streams live, and update the Jenkins URL in the system configuration so webhooks and agent connections use the public HTTPS address.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>How does Jenkins persist configuration?</div><div class="a">Objects are serialised to XML with XStream — one <span class="path">config.xml</span> per job and one global file. Loading is deserialisation, so "Reload Configuration from Disk" re-reads those files. It also means a corrupt file stops the boot, which is why I keep backups and manage important settings with JCasC.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>What JVM tuning do you apply to a controller?</div><div class="a">Set <code>-Xmx</code> to 2–4 GB, keep the controller's executor count at 0 so builds don't share that heap, and monitor GC and old-gen usage. Most "Jenkins is slow" incidents are GC pressure caused by running builds on the controller.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>Which ports does Jenkins use?</div><div class="a"><code>8080</code> HTTP, <code>443</code> via proxy, <code>50000</code> for inbound JNLP agents; SSH agents are contacted outbound on <code>22</code>. In production I expose only 443 and keep 8080 and 50000 on localhost or a private network.</div></div>
+</div>
+
+<h3><span class="hn">1.16</span> Files this block touches</h3>
+<div class="tw"><table><thead><tr><th>File</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><span class="path">jenkins/ec2-install.sh</span></td><td>Full install: Java 21 → Jenkins LTS → Docker → permissions</td></tr>
+<tr><td><span class="path">jenkins/plugins.txt</span></td><td>Plugin manifest — add the four Block-1 plugins now</td></tr>
+<tr><td><span class="path">/etc/default/jenkins</span></td><td>JVM args, <code>JENKINS_HOME</code>, listen address</td></tr>
+<tr><td><span class="path">/etc/nginx/sites-available/jenkins</span></td><td>Reverse proxy + TLS</td></tr>
+</tbody></table></div>
+</section>

@@ -1,0 +1,326 @@
+<section class="block" id="block-6" data-block="6" data-title="TEST stage + reports">
+    <div class="bhead"><div class="bnum">06</div><div>
+      <div class="bl">Block 6 · Foundation</div>
+      <h2>TEST stage + reports &amp; quality gates</h2>
+      <p class="bgoal"><b>Goal:</b> run the test suites, publish machine-readable results Jenkins can graph, and make coverage a real gate — not a number nobody reads.</p>
+    </div></div>
+
+    <h3><span class="hn">6.1</span> Why reports matter more than logs</h3>
+    <p>Green text in a console log is worthless to a team: you can't trend it, filter it, or see <em>which test</em> broke. JUnit XML turns test output into data Jenkins stores per build — a trend graph, a per-test history, and a "this test has been flaky for 3 days" signal.</p>
+
+    <h3><span class="hn">6.2</span> Producing JUnit XML</h3>
+    <div class="tabs">
+      <div class="tabbar">
+        <button class="tab on" data-t="n6">🟩 Node (Jest)</button>
+        <button class="tab" data-t="p6">🐍 Python (pytest)</button>
+      </div>
+      <div class="tabpane on" data-t="n6">
+        <div class="code" data-lang="json"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">json</span><span class="fn">nodejs-app/package.json — add jest-junit + coverage reporters</span><button class="copy">📋 Copy</button></div><pre><code>"scripts": {
+  "test":       "jest --ci --coverage",
+  "test:junit": "jest --ci --coverage --reporters=default --reporters=jest-junit",
+  "lint":       "eslint ."
+},
+"devDependencies": {
+  "eslint": "^8.57.0",
+  "jest": "^29.7.0",
+  "jest-junit": "^16.0.0",
+  "supertest": "^6.3.4"
+},
+"jest-junit": {
+  "outputDirectory": "reports",
+  "outputName": "junit.xml"
+}</code></pre></div>
+        <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">What it produces</span><button class="copy">📋 Copy</button></div><pre><code>reports/junit.xml          # JUnit XML  -> junit step
+coverage/lcov.info         # LCOV       -> Coverage / SonarQube
+coverage/cobertura-coverage.xml</code></pre></div>
+      </div>
+      <div class="tabpane" data-t="p6">
+        <div class="code" data-lang="properties"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">ini</span><span class="fn">python-app/pytest.ini — built-in JUnit + coverage, no plugin needed</span><button class="copy">📋 Copy</button></div><pre><code>[pytest]
+testpaths = tests
+addopts =
+    --junitxml=reports/junit.xml
+    --cov=app
+    --cov-report=xml:coverage.xml
+    --cov-report=term-missing
+    --cov-report=html:htmlcov</code></pre></div>
+        <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">What it produces</span><button class="copy">📋 Copy</button></div><pre><code>reports/junit.xml          # JUnit XML
+coverage.xml               # Cobertura XML -> Coverage plugin + SonarQube
+htmlcov/index.html         # browsable HTML report</code></pre></div>
+      </div>
+    </div>
+
+    <h3><span class="hn">6.3</span> Publishing the reports</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">The three publish steps</span><button class="copy">📋 Copy</button></div><pre><code>post {
+    always {
+        // 1. Test results -> per-test history, trend graph, flaky detection
+        junit testResults: 'reports/junit.xml',
+              allowEmptyResults: true,
+              skipPublishingChecks: false
+
+        // 2. Coverage (modern "Coverage" plugin, replaces the old Cobertura plugin)
+        recordCoverage tools: [[parser: 'COBERTURA', pattern: 'coverage/cobertura-coverage.xml']],
+                       id: 'coverage', name: 'Code Coverage',
+                       sourceCodeRetention: 'EVERY_BUILD'
+
+        // 3. Keep the HTML report + artifacts for humans
+        archiveArtifacts artifacts: 'reports/**,htmlcov/**,coverage/**',
+                         allowEmptyArchive: true, fingerprint: true
+    }
+}</code></pre></div>
+    <div class="note"><span class="lbl"><span class="ic">📦</span>Plugin</span>
+    Install <strong>Coverage</strong> (<code>coverage</code>) — the modern successor to the Cobertura plugin. For Python point the parser at <span class="path">coverage.xml</span> with <code>parser: 'COBERTURA'</code>; it's the same XML schema pytest-cov writes.</div>
+
+    <h3><span class="hn">6.4</span> FAILURE vs UNSTABLE — the distinction interviewers probe</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Result</th><th>Means</th><th>Typical cause</th><th>Ball colour</th></tr></thead>
+      <tbody>
+        <tr><td><code>SUCCESS</code></td><td>Everything passed</td><td>—</td><td>🔵 blue/green</td></tr>
+        <tr><td><code>UNSTABLE</code></td><td>Built fine, but quality is below standard</td><td>Tests failed, coverage under threshold, quality gate red</td><td>🟡 yellow</td></tr>
+        <tr><td><code>FAILURE</code></td><td>Something threw an error</td><td>Compile error, missing file, non-zero exit code</td><td>🔴 red</td></tr>
+        <tr><td><code>ABORTED</code></td><td>A human or timeout stopped it</td><td>Manual cancel, <code>timeout</code>, approval declined</td><td>⚪ grey</td></tr>
+      </tbody>
+    </table></div>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Marking a build unstable instead of failing it</span><button class="copy">📋 Copy</button></div><pre><code>// catchError: the stage turns red, the build becomes UNSTABLE and CONTINUES
+stage('Tests') {
+    steps {
+        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+            sh 'npm test'
+        }
+    }
+}
+
+// Or keep the build green while flagging the stage (use sparingly!)
+catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') { sh 'npm run lint' }
+
+// Set it manually from Groovy
+script {
+    if (env.COVERAGE_PCT &amp;&amp; env.COVERAGE_PCT.toInteger() &lt; 70) {
+        currentBuild.result = 'UNSTABLE'
+        echo "Coverage ${env.COVERAGE_PCT}% is below the 70% gate"
+    }
+}</code></pre></div>
+
+    <h3><span class="hn">6.5</span> A real coverage gate</h3>
+    <p>Don't just <em>report</em> coverage — enforce it, so the number can't rot. Both ecosystems can do it natively:</p>
+    <div class="tabs">
+      <div class="tabbar">
+        <button class="tab on" data-t="ng">🟩 Node</button>
+        <button class="tab" data-t="pg">🐍 Python</button>
+      </div>
+      <div class="tabpane on" data-t="ng">
+        <div class="code" data-lang="json"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">json</span><span class="fn">nodejs-app/package.json → jest.coverageThreshold</span><button class="copy">📋 Copy</button></div><pre><code>"jest": {
+  "testEnvironment": "node",
+  "collectCoverageFrom": ["src/**/*.js"],
+  "coverageReporters": ["text-summary", "lcov", "cobertura"],
+  "coverageThreshold": {
+    "global": { "lines": 70, "statements": 70, "branches": 50, "functions": 60 }
+  }
+}</code></pre></div>
+        <p style="font-size:14.5px">Jest exits non-zero when the threshold is missed — one line, no extra plugin.</p>
+      </div>
+      <div class="tabpane" data-t="pg">
+        <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">pytest --cov-fail-under</span><button class="copy">📋 Copy</button></div><pre><code>. venv/bin/activate
+pytest --cov=app --cov-report=xml:coverage.xml \
+       --cov-report=term-missing --cov-fail-under=70</code></pre></div>
+        <p style="font-size:14.5px">Or move it into <span class="path">pytest.ini</span> so nobody can forget it: <code>addopts = … --cov-fail-under=70</code>.</p>
+      </div>
+    </div>
+
+    <h3><span class="hn">6.6</span> ✍️ Jenkinsfiles v6 — tests + reports</h3>
+    <div class="tabs">
+      <div class="tabbar">
+        <button class="tab on" data-t="n6b">🟩 nodejs-app/Jenkinsfile</button>
+        <button class="tab" data-t="p6b">🐍 python-app/Jenkinsfile</button>
+      </div>
+      <div class="tabpane on" data-t="n6b">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">nodejs-app/Jenkinsfile — v6 (Test)</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+    options { timestamps(); timeout(time: 20, unit: 'MINUTES') }
+
+    environment { APP_NAME = 'nodejs-app'; npm_config_cache = '/var/lib/jenkins/.npm' }
+
+    stages {
+        stage('Checkout') {
+            steps { dir(APP_NAME) { checkout scmGit(branches: [[name: '*/main']],
+                        extensions: [cleanBeforeCheckout()],
+                        userRemoteConfigs: [[credentialsId: 'github-ssh',
+                            url: 'git@github.com:&lt;you&gt;/jenkins-zero-to-hero.git']]) } }
+        }
+        stage('Build') {
+            steps { dir(APP_NAME) { sh 'npm ci' } }
+        }
+        stage('Test') {
+            steps {
+                dir(APP_NAME) {
+                    // coverageThreshold in package.json enforces the quality gate
+                    sh label: 'unit tests + coverage', script: 'npm run test:junit'
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            dir(APP_NAME) {
+                junit testResults: 'reports/junit.xml', allowEmptyResults: true
+                recordCoverage tools: [[parser: 'COBERTURA', pattern: 'coverage/cobertura-coverage.xml']],
+                               sourceCodeRetention: 'LAST_BUILD'
+                archiveArtifacts artifacts: 'reports/**,coverage/**', allowEmptyArchive: true
+            }
+            echo "Result: ${currentBuild.currentResult}"
+        }
+    }
+}</code></pre></div>
+      </div>
+      <div class="tabpane" data-t="p6b">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">python-app/Jenkinsfile — v6 (Test)</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+    options { timestamps(); timeout(time: 20, unit: 'MINUTES') }
+
+    environment { APP_NAME = 'python-app'; PIP_CACHE_DIR = '/var/lib/jenkins/.cache/pip' }
+
+    stages {
+        stage('Checkout') {
+            steps { dir(APP_NAME) { checkout scmGit(branches: [[name: '*/main']],
+                        extensions: [cleanBeforeCheckout()],
+                        userRemoteConfigs: [[credentialsId: 'github-ssh',
+                            url: 'git@github.com:&lt;you&gt;/jenkins-zero-to-hero.git']]) } }
+        }
+        stage('Build') {
+            steps { dir(APP_NAME) { sh '''
+                        python3 -m venv venv
+                        . venv/bin/activate
+                        pip install --upgrade pip
+                        pip install -r requirements-dev.txt
+                    ''' } }
+        }
+        stage('Test') {
+            steps {
+                dir(APP_NAME) {
+                    sh label: 'unit tests + coverage gate',
+                       script: '. venv/bin/activate &amp;&amp; pytest --cov-fail-under=70'
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            dir(APP_NAME) {
+                junit testResults: 'reports/junit.xml', allowEmptyResults: true
+                recordCoverage tools: [[parser: 'COBERTURA', pattern: 'coverage.xml']],
+                               sourceCodeRetention: 'LAST_BUILD'
+                archiveArtifacts artifacts: 'reports/**,htmlcov/**', allowEmptyArchive: true
+            }
+            echo "Result: ${currentBuild.currentResult}"
+        }
+    }
+}</code></pre></div>
+      </div>
+    </div>
+
+    <div class="info"><span class="lbl"><span class="ic">📊</span>What you should now see in the UI</span>
+    On the job page: a <strong>Test Result</strong> trend graph, a <strong>Coverage</strong> trend, per-test history ("this test failed 3 times last week"), and a link to the archived HTML report. That's the difference between "we run tests" and "we manage quality".</div>
+
+    <h3><span class="hn">6.7</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>Both jobs show <strong>Test Result</strong> and <strong>Coverage</strong> trends on the job page.</li>
+      <li>I broke a test on purpose and watched the build turn red with the failing test named.</li>
+      <li>I dropped coverage below the threshold and saw the build fail at the Test stage.</li>
+      <li>I can explain SUCCESS vs UNSTABLE vs FAILURE with an example of each.</li>
+    </ul>
+
+    <h3><span class="hn">6.8</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>How does Jenkins know a test failed?</div><div class="a">Two ways. The shell step's non-zero exit code fails the build immediately, or the <code>junit</code> step parses the XML and, if any test case is a failure/error, marks the build <strong>UNSTABLE</strong>. Publishing XML gives far better feedback because Jenkins then knows <em>which</em> test and keeps per-test history.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>What is the difference between UNSTABLE and FAILURE?</div><div class="a">FAILURE means the pipeline threw an error — compile error, missing file, non-zero exit. UNSTABLE means it completed but quality criteria weren't met: failing tests, coverage under threshold, or a SonarQube quality gate in red. UNSTABLE is "built, but don't ship it".</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>How do you enforce a coverage gate?</div><div class="a">Make the test command exit non-zero below the threshold — Jest's <code>coverageThreshold</code> or pytest's <code>--cov-fail-under</code> — and publish the XML so the trend is visible. Later (Block 16) SonarQube enforces the same idea across duplication, smells and vulnerabilities.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>How do you handle flaky tests in CI?</div><div class="a">Publish JUnit XML so Jenkins tracks flakiness per test, quarantine the flaky test out of the blocking gate, and fix or delete it with a deadline. My rule: a flaky test is a bug in the test or the product — never something you just retry away.</div></div>
+    </div>
+
+    <h3><span class="hn">6.9</span> 🔥 Common errors</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Error</th><th>Cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><code>No test report files were found</code></td><td>Wrong path — you published from the workspace root while tests wrote to <code>nodejs-app/reports/</code></td><td>Wrap the <code>junit</code> step in <code>dir(APP_NAME) { }</code>, or use <code>**/reports/junit.xml</code></td></tr>
+        <tr><td>Tests pass locally, fail in Jenkins</td><td>Dev dependency missing, timezone, or a port already in use</td><td>Run <code>npm ci</code>/<code>pip install -r</code> in CI exactly as locally; never bind fixed ports in tests</td></tr>
+        <tr><td><code>recordCoverage</code> unknown step</td><td>Coverage plugin not installed</td><td>Install the <strong>Coverage</strong> plugin (or use the older <code>cobertura</code> step)</td></tr>
+        <tr><td>Coverage is 0%</td><td><code>collectCoverageFrom</code>/<code>--cov</code> points at the wrong path</td><td>Point coverage at the code actually imported by the tests</td></tr>
+      </tbody>
+    </table></div>
+
+<h3><span class="hn">6.10</span> Under the hood — what JUnit XML contains</h3>
+<p>The report is just XML. Understanding its shape lets you debug "why is my test result empty" in seconds.</p>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">xml</span><span class="fn">reports/junit.xml — the schema Jenkins parses</span><button class="copy">📋 Copy</button></div><pre><code>&lt;testsuites name="jest tests"&gt;
+  &lt;testsuite name="items API" tests="3" failures="1" errors="0" skipped="0" time="0.412"&gt;
+    &lt;testcase name="GET /api/items lists seeded items" classname="items API" time="0.031"/&gt;
+    &lt;testcase name="POST /api/items creates an item (201)" classname="items API" time="0.019"&gt;
+      &lt;failure message="expected 201, received 400"&gt;
+        at Object.&lt;anonymous&gt; (tests/app.test.js:31:26)
+      &lt;/failure&gt;
+    &lt;/testcase&gt;
+  &lt;/testsuite&gt;
+&lt;/testsuites&gt;</code></pre></div>
+<ul>
+<li>Jenkins builds its <strong>per-test history</strong> from the <code>name</code> + <code>classname</code> pair. Rename a test and you break its history — which is why flaky-test detection needs stable test names.</li>
+<li>Any <code>&lt;failure&gt;</code> or <code>&lt;error&gt;</code> child marks the build <strong>UNSTABLE</strong> (not FAILED), because the pipeline itself completed.</li>
+<li><code>allowEmptyResults: true</code> stops the step failing when the file is missing — essential when tests didn't run at all.</li>
+</ul>
+
+<h3><span class="hn">6.11</span> Lab — break the pipeline three ways</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 6.1 · Failure, unstable, and silent success</span>
+<strong>1. A failing test.</strong> Change an assertion in <span class="path">tests/app.test.js</span>, commit, run. The stage goes red, the build is <strong>UNSTABLE</strong> (because <code>junit</code> reported failures) — unless your <code>sh</code> also exits non-zero, in which case it's <strong>FAILURE</strong>. Understand which one you got and why.
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Making the distinction explicit</span><button class="copy">📋 Copy</button></div><pre><code>// A: command fails -> stage red, build FAILED, later stages skipped
+sh 'npm test'
+
+// B: command fails -> stage red, build UNSTABLE, pipeline continues
+catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') { sh 'npm test' }
+
+// C: report published, result decided by the JUnit content only
+sh(script: 'npm test', returnStatus: true)     // swallow the exit code
+junit testResults: 'reports/junit.xml'         // UNSTABLE if any case failed</code></pre></div>
+<strong>2. Coverage below the gate.</strong> Set <code>--cov-fail-under=95</code> and watch the Test stage fail with a clear message.
+<br/><strong>3. Missing report.</strong> Point <code>junit</code> at the wrong path and see <code>No test report files were found</code> — then fix it with <code>dir()</code>.</div>
+
+<h3><span class="hn">6.12</span> Choosing a coverage tool and parser</h3>
+<div class="tw"><table>
+<thead><tr><th>Source</th><th>Report file</th><th>Parser for <code>recordCoverage</code></th></tr></thead>
+<tbody>
+<tr><td>Jest</td><td><span class="path">coverage/cobertura-coverage.xml</span></td><td><code>COBERTURA</code></td></tr>
+<tr><td>Jest (alternative)</td><td><span class="path">coverage/lcov.info</span></td><td><code>JACOCO</code> (LCOV) — used by Sonar</td></tr>
+<tr><td>pytest-cov</td><td><span class="path">coverage.xml</span></td><td><code>COBERTURA</code></td></tr>
+<tr><td>Go</td><td><span class="path">coverage.out</span></td><td><code>GO_COV</code></td></tr>
+<tr><td>Java / Maven</td><td><span class="path">target/site/jacoco/jacoco.xml</span></td><td><code>JACOCO</code></td></tr>
+</tbody>
+</table></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Coverage with an explicit quality gate</span><button class="copy">📋 Copy</button></div><pre><code>recordCoverage(
+    tools: [[parser: 'COBERTURA', pattern: '**/coverage.xml']],
+    id: 'cov', name: 'Backend coverage',
+    sourceCodeRetention: 'EVERY_BUILD',
+    qualityGates: [
+        [threshold: 70.0, metric: 'LINE',     baseline: 'PROJECT', unstable: true],
+        [threshold: 50.0, metric: 'BRANCH',   baseline: 'PROJECT', unstable: true]
+    ]
+)</code></pre></div>
+<p>With <code>qualityGates</code> the coverage plugin itself can mark the build unstable — useful when you want the gate enforced centrally rather than inside the test command.</p>
+
+<h3><span class="hn">6.13</span> Flaky tests — policy, not hope</h3>
+<div class="tw"><table>
+<thead><tr><th>Practice</th><th>Detail</th></tr></thead>
+<tbody>
+<tr><td>Never retry a test away</td><td>A retry hides the bug and destroys signal. Fix or quarantine.</td></tr>
+<tr><td>Quarantine with a deadline</td><td>Move the flaky test to a non-blocking suite with a ticket and an expiry date.</td></tr>
+<tr><td>Common causes to check</td><td>Shared mutable state, real time/sleep, fixed ports, network calls, test order dependence, unseeded randomness.</td></tr>
+<tr><td>Parallel safety</td><td>Use <code>EXECUTOR_NUMBER</code> for any port or temp directory, so parallel builds don't collide.</td></tr>
+<tr><td>Track it</td><td>JUnit history shows "failed 4 of last 20" — that's your evidence for prioritising the fix.</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">6.14</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q5</span>Why is my build UNSTABLE instead of FAILED?</div><div class="a">Because something reported a quality problem rather than an error — most often the <code>junit</code> step finding failing test cases, or a coverage/quality gate. The pipeline ran to completion; it just didn't meet the standard. I use that distinction to alert differently.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q6</span>How do you handle flaky tests?</div><div class="a">Publish JUnit XML so Jenkins tracks per-test history, then quarantine the flaky test out of the blocking suite with a ticket and a deadline, and fix the root cause — usually shared state, real time, a fixed port or network dependency. I never add a blanket retry.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>How do you make tests safe to run in parallel on one agent?</div><div class="a">Never bind fixed ports or use fixed temp paths. I derive them from <code>env.EXECUTOR_NUMBER</code> or <code>env.BUILD_TAG</code>, and keep all state inside the build's own workspace or a container.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>Coverage dropped from 85% to 40% overnight with no test changes. Why?</div><div class="a">Almost always the <code>collectCoverageFrom</code> / <code>--cov</code> path changed, or new files were added outside the instrumented directory. Coverage measures what you told it to measure, so a renamed source folder silently resets the denominator.</div></div>
+</div>
+</section>

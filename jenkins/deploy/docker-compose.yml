@@ -1,0 +1,33 @@
+# Block 19 — lives on the DEPLOY TARGET (staging / prod host), not on Jenkins.
+# The pipeline only ever sets IMAGE_REPO + IMAGE_TAG, then runs:
+#     docker compose pull && docker compose up -d --remove-orphans
+version: "3.8"
+services:
+  nodejs-app:
+    image: ${IMAGE_REPO}:${IMAGE_TAG}
+    container_name: nodejs-app
+    restart: unless-stopped
+    ports: ["3000:3000"]
+    environment:
+      PORT: 3000
+      NODE_ENV: production
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  python-app:
+    image: ${IMAGE_REPO}:${IMAGE_TAG}
+    container_name: python-app
+    restart: unless-stopped
+    ports: ["5000:5000"]
+    environment:
+      PORT: 5000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ['PORT']+'/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

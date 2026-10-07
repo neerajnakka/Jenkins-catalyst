@@ -1,0 +1,240 @@
+<section class="block" id="block-20" data-block="20" data-title="Notifications &amp; approvals">
+    <div class="bhead"><div class="bnum">20</div><div>
+      <div class="bl">Block 20 · DevSecOps &amp; scale</div>
+      <h2>Notifications &amp; human approvals</h2>
+      <p class="bgoal"><b>Goal:</b> get the right message to the right channel, and put a deliberate human checkpoint in front of risky actions.</p>
+    </div></div>
+
+    <h3><span class="hn">20.1</span> The <code>input</code> step — pausing for a human</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Approval gate with timeout, allowed approvers and captured values</span><button class="copy">📋 Copy</button></div><pre><code>stage('Approve production deploy') {
+    when { branch 'main' }
+    steps {
+        script {
+            timeout(time: 30, unit: 'MINUTES') {          // never wait forever
+                def approval = input(
+                    id: 'ProdDeploy',
+                    message: "Deploy ${IMAGE}:${env.GIT_SHA} to PRODUCTION?",
+                    ok: 'Ship it',
+                    submitter: 'release-managers,admins',   // Jenkins users/groups allowed to approve
+                    submitterParameter: 'APPROVER',         // who approved -> approval.APPROVER
+                    parameters: [
+                        choice(name: 'STRATEGY', choices: ['rolling','blue-green'], description: 'Deploy strategy'),
+                        booleanParam(name: 'RUN_SMOKE', defaultValue: true, description: 'Run smoke tests after')
+                    ]
+                )
+                env.APPROVER      = approval['APPROVER']
+                env.DEPLOY_STRATEGY = approval['STRATEGY']
+                echo "Approved by ${env.APPROVER} using ${env.DEPLOY_STRATEGY}"
+            }
+        }
+    }
+}</code></pre></div>
+    <div class="tw"><table>
+      <thead><tr><th>Option</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>message</code></td><td>Shown in the UI prompt — include <em>what</em> is being deployed</td></tr>
+        <tr><td><code>ok</code></td><td>Label for the confirm button ("Deploy", not "Proceed")</td></tr>
+        <tr><td><code>submitter</code></td><td>Comma-separated users/groups allowed to approve (pairs with RBAC)</td></tr>
+        <tr><td><code>submitterParameter</code></td><td>Captures who approved, for the audit trail</td></tr>
+        <tr><td><code>parameters</code></td><td>Collect extra decisions at approval time</td></tr>
+        <tr><td><code>id</code></td><td>Stable identifier — required if you use the API to approve</td></tr>
+      </tbody>
+    </table></div>
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>Always wrap <code>input</code> in <code>timeout</code></span>
+    An <code>input</code> with no timeout holds an executor and a workspace indefinitely — the classic "why is Jenkins out of executors?" outage. Wrapping it in <code>timeout()</code> also gives you a defined result: timeouts abort the build, which you can handle in <code>post { aborted { } }</code>.</div>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Approval outside a stage's agent (best practice)</span><button class="copy">📋 Copy</button></div><pre><code>stage('Approve') {
+    agent none                 // don't hold an agent while waiting for a human!
+    when { beforeAgent true; branch 'main' }
+    steps {
+        timeout(time: 30, unit: 'MINUTES') {
+            input message: 'Deploy to production?', ok: 'Deploy'
+        }
+    }
+}</code></pre></div>
+    <p><code>beforeAgent true</code> evaluates the <code>when</code> condition <em>before</em> an agent is allocated — combined with <code>agent none</code> this means no executor is consumed while waiting.</p>
+
+    <h3><span class="hn">20.2</span> Slack notifications</h3>
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">ui</span><span class="fn">One-time Slack setup</span><button class="copy">📋 Copy</button></div><pre><code>1. Install the "Slack Notification" plugin
+2. Manage Jenkins -> System -> Slack
+     Workspace      : your-workspace
+     Credential     : add a "Secret text" credential with the bot token (ID: slack-bot)
+     Default channel: #ci
+3. Test Connection -> "Success" before you rely on it</code></pre></div>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">slackSend in post conditions</span><button class="copy">📋 Copy</button></div><pre><code>post {
+    success {
+        slackSend channel: '#ci', color: 'good',
+            message: "✅ *${env.JOB_NAME}* #${env.BUILD_NUMBER} succeeded\n" +
+                     "Image: \`${IMAGE}:${env.GIT_SHA}\`\n&lt;${env.BUILD_URL}|Open build&gt;"
+    }
+    failure {
+        slackSend channel: '#ci', color: 'danger',
+            message: "❌ *${env.JOB_NAME}* #${env.BUILD_NUMBER} FAILED (&lt;${env.BUILD_URL}|logs&gt;)"
+    }
+    unstable {
+        slackSend channel: '#ci', color: 'warning',
+            message: "⚠️ *${env.JOB_NAME}* #${env.BUILD_NUMBER} unstable — quality gates not met"
+    }
+    fixed {
+        slackSend channel: '#ci', color: 'good', message: "🎉 Back to green!"
+    }
+}</code></pre></div>
+
+    <h3><span class="hn">20.3</span> Email (Extended E-mail Notification)</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">emailext with an HTML body and a log excerpt</span><button class="copy">📋 Copy</button></div><pre><code>post {
+    failure {
+        script {
+            def culprits = currentBuild.changeSets
+                    .collectMany { it.items.collect { it.author.email ?: it.author.fullName } }
+                    .unique().join(',')
+            def log = currentBuild.rawBuild.getLog(60).join('\n')     // last 60 lines
+
+            emailext(
+                subject: "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                to: culprits ?: 'devops@example.com',
+                mimeType: 'text/html',
+                body: """
+                    &lt;h3 style="color:#e11d48"&gt;Build FAILED&lt;/h3&gt;
+                    &lt;p&gt;&lt;b&gt;Job:&lt;/b&gt; ${env.JOB_NAME} #${env.BUILD_NUMBER}&lt;br/&gt;
+                       &lt;b&gt;Branch:&lt;/b&gt; ${env.BRANCH_NAME ?: 'n/a'}&lt;br/&gt;
+                       &lt;b&gt;Commit:&lt;/b&gt; ${env.GIT_SHA}&lt;br/&gt;
+                       &lt;a href="${env.BUILD_URL}"&gt;Open in Jenkins&lt;/a&gt;&lt;/p&gt;
+                    &lt;pre style="background:#0d1526;color:#dce6f5;padding:12px"&gt;${log}&lt;/pre&gt;
+                """,
+                attachLog: true,
+                compressLog: true
+            )
+        }
+    }
+}</code></pre></div>
+
+    <h3><span class="hn">20.4</span> Any other system (generic webhook)</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Teams / Discord / PagerDuty via httpRequest</span><button class="copy">📋 Copy</button></div><pre><code>// Requires the "HTTP Request" plugin
+def response = httpRequest(
+    httpMode: 'POST',
+    url: 'https://events.pagerduty.com/v2/enqueue',
+    contentType: 'APPLICATION_JSON',
+    requestBody: groovy.json.JsonOutput.toJson([
+        routing_key: PD_KEY, event_action: 'trigger',
+        payload: [summary: "Jenkins ${env.JOB_NAME} failed", severity: 'error', source: env.NODE_NAME]
+    ])
+)
+echo "PagerDuty responded ${response.status}"</code></pre></div>
+
+    <h3><span class="hn">20.5</span> Notification design principles</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Principle</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Notify on <em>state change</em>, not every build</td><td>200 "build passed" messages a day = nobody reads any of them</td></tr>
+        <tr><td>Failures go to the person who broke it</td><td><code>currentBuild.changeSets</code> gives you the commit authors</td></tr>
+        <tr><td>Include a deep link and the artifact identity</td><td><code>${BUILD_URL}</code> and the SHA tag — no context switching</td></tr>
+        <tr><td>Page only for regressions on release branches</td><td>Use <code>post { regression { } }</code> and branch conditions</td></tr>
+        <tr><td>Never let notifications fail the build</td><td>Wrap in <code>try/catch</code> or <code>catchError</code> — a Slack outage must not break CI</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">20.6</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>An approval gate pauses the prod deploy and times out after 30 minutes.</li>
+      <li>Slack (or email) receives failure and success messages with a build link.</li>
+      <li>Notification failures cannot break the build.</li>
+      <li>Only changed-state events notify (no spam on every green build).</li>
+    </ul>
+
+    <h3><span class="hn">20.7</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>How do you add a manual approval to a pipeline?</div><div class="a">With the <code>input</code> step inside a <code>timeout()</code>, restricted by <code>submitter</code> to a release group and captured with <code>submitterParameter</code> for the audit trail. I put it in a stage with <code>agent none</code> and <code>when { beforeAgent true }</code> so no executor is held while waiting for a human.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>Why is an un-timeout'd <code>input</code> dangerous?</div><div class="a">It occupies an executor and a workspace indefinitely. Enough of them and the queue backs up until no build can run at all. A <code>timeout</code> turns that into a controlled abort I can handle in <code>post { aborted { } }</code>.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>How do you avoid notification fatigue?</div><div class="a">Notify on state transitions — <code>failure</code>, <code>fixed</code>, <code>regression</code> — rather than on every success, route failures to the commit authors from <code>currentBuild.changeSets</code>, and reserve paging for regressions on release branches.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>Slack is down. Your build fails? </div><div class="a">It must not. Notification steps are wrapped so their failure is logged, not propagated — losing a Slack message is acceptable, losing a build because the chat provider had an outage is not.</div></div>
+    </div>
+
+<h3><span class="hn">20.8</span> Under the hood — how approval actually works</h3>
+<div class="info"><span class="lbl"><span class="ic">💡</span>The mental model</span>
+While a pipeline is paused at <code>input</code>, the build is <strong>still occupying an executor</strong> and its state is persisted to disk. That's why it survives a controller restart. It's also why a long <code>input</code> inside <code>node {}</code> is expensive — prefer <code>agent none</code> plus a lightweight approval stage.</div>
+<div class="tw"><table>
+<thead><tr><th>Where the approval comes from</th><th>Mechanism</th></tr></thead>
+<tbody>
+<tr><td>A human clicks in the UI</td><td>Jenkins renders the <code>input</code> form with your parameters and submitters</td></tr>
+<tr><td>A script or chat bot approves</td><td>POST to <span class="path">/job/&lt;job&gt;/&lt;n&gt;/input/&lt;id&gt/submit</span> with <code>proceed=</code> and the parameter JSON</td></tr>
+<tr><td>A timeout fires</td><td>The step throws <code>FlowInterruptedException</code> → the build is aborted unless you wrap it</td></tr>
+</tbody>
+</table></div>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Approve from the CLI / chat bot</span><button class="copy">📋 Copy</button></div><pre><code># List pending inputs
+curl -sS -u "user:$API_TOKEN" \
+  "$JENKINS_URL/job/nodejs-pipeline/job/main/42/wfapi/pendingInputActions" | jq
+
+# Approve (parameter name must match the input parameter exactly)
+curl -sS -u "user:$API_TOKEN" -X POST \
+  "$JENKINS_URL/job/nodejs-pipeline/job/main/42/input/ProdDeploy/submit" \
+  --data-urlencode 'json={"parameter":[{"name":"APPROVE","value":"true"}]}' \
+  --data 'proceed=Approve' </code></pre></div>
+
+<h3><span class="hn">20.9</span> Input patterns worth memorising</h3>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Pattern catalogue</span><button class="copy">📋 Copy</button></div><pre><code>// 1. Simple go/no-go restricted to a group
+input message: 'Deploy to production?', ok: 'Deploy',
+      submitter: 'release-managers',
+      submitterParameter: 'APPROVED_BY'
+
+// 2. Capture a value the pipeline then uses
+def target = input(id: 'EnvChoice', message: 'Where?',
+      parameters: [choice(name: 'ENV', choices: ['staging','prod'],
+                          description: 'Target environment')])
+echo "Deploying to ${target['ENV']}"
+
+// 3. Timeout that FAILS FAST rather than aborting silently
+timeout(time: 30, unit: 'MINUTES') {
+    input message: 'Approve?'
+}
+
+// 4. Timeout that degrades gracefully (skip instead of fail)
+def approved = false
+try {
+    timeout(time: 10, unit: 'MINUTES') {
+        input message: 'Deploy now? (skips after 10 min)'
+    }
+    approved = true
+} catch (err) {
+    echo "No approval in time (${err}) - continuing without deploy"
+}
+
+// 5. Only ask when the change is risky
+if (env.BRANCH_NAME == 'main' &amp;&amp; currentBuild.number % 5 != 0) {
+    input message: 'main branch - confirm'
+}</code></pre></div>
+
+<h3><span class="hn">20.10</span> Lab — approvals under pressure</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 20.1 · Break the gate three ways</span>
+<strong>1. No submitter restriction.</strong> Remove <code>submitter:</code>, run the pipeline, and confirm any authenticated user can approve. That is a real audit finding.
+<br/><strong>2. Timeout with no handler.</strong> Set <code>timeout(time: 1, unit: 'MINUTES')</code> around the input, walk away, and observe the build result (ABORTED, not FAILED) and what <code>post</code> conditions fire.
+<br/><strong>3. Restart mid-approval.</strong> Start a build, wait for the prompt, then <code>sudo systemctl restart jenkins</code>. Log back in: the prompt is still there. This is durable pipeline state, and it's worth being able to describe it from memory.
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Watch it survive</span><button class="copy">📋 Copy</button></div><pre><code>sudo systemctl restart jenkins
+sleep 20 &amp;&amp; curl -sSI http://localhost:8080/login | head -1</code></pre></div>
+</div>
+
+<h3><span class="hn">20.11</span> Governance: who may approve what</h3>
+<div class="tw"><table>
+<thead><tr><th>Change type</th><th>Approval</th></tr></thead>
+<tbody>
+<tr><td>Feature branch build</td><td>None — automatic</td></tr>
+<tr><td>Deploy to dev / staging</td><td>None — automatic, self-service</td></tr>
+<tr><td>Deploy to production (normal)</td><td>One approval from the on-call engineer</td></tr>
+<tr><td>Deploy to production (out of hours / Friday)</td><td>Two approvals, one from release management</td></tr>
+<tr><td>Schema migration or rollback</td><td>Engineering manager + DBA</td></tr>
+<tr><td>Hotfix</td><td>Automatic to staging, retro-approval logged</td></tr>
+</tbody>
+</table></div>
+<div class="dang"><span class="lbl"><span class="ic">🚨</span>Two approval anti-patterns</span>
+<ul style="margin:0;padding-left:20px">
+<li><strong>Approval on every commit.</strong> It becomes reflex clicking and provides no safety. Gate only consequential actions.</li>
+<li><strong>Self-approval.</strong> Enable <em>Prevent self-approval</em> or use a submitter group the author isn't in, otherwise the control is decorative.</li>
+</ul></div>
+
+<h3><span class="hn">20.12</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>What happens to resources while waiting for input?</div><div class="a">The build keeps its executor and its state is persisted, so it survives a controller restart. To avoid blocking an executor for hours, put the approval in a stage with a lightweight agent (or <code>agent none</code> at top level with a tiny agent for that stage), and set a timeout.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>Approval timed out — what build result do you get and how do you handle it?</div><div class="a">ABORTED, via a <code>FlowInterruptedException</code>. If I want a different outcome I wrap the input in <code>try/catch</code> and decide: skip the deployment and continue, fail the build, or notify. I make sure the <code>post</code> block treats ABORTED explicitly rather than lumping it in with failure.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>How do you restrict who can approve a production deploy?</div><div class="a">With the <code>submitter</code> parameter naming a user or group, plus <code>submitterParameter</code> to record who approved into the build record. I also enable "prevent self-approval" so the person who authored the change cannot be the one who approves it.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>How do you make approvals auditable?</div><div class="a">Record the approver (<code>submitterParameter</code>), the timestamp, the artifact identifier and the environment in the build description, and ship that to the audit log or chat channel. The build record must be able to answer who deployed what, when, and on whose authority.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q10</span>Should production deploys be manual at all?</div><div class="a">Mature teams gate on evidence rather than on a human: canary or blue-green with automated health checks and automatic rollback. Manual approval is right while that safety net is immature, and for genuinely irreversible actions like destructive schema changes. The goal is to earn the right to remove the gate.</div></div>
+</div>
+</section>

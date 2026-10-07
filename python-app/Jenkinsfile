@@ -1,0 +1,306 @@
+// ============================================================================
+//  python-app/Jenkinsfile  --  FINAL (v20)
+//  Built block by block in docs/jenkins-complete-guide.html
+//
+//  Checkout -> Build -> (parallel: lint, Bandit, pip-audit, secrets) -> Test ->
+//  SAST -> Docker build -> container smoke test -> image scan -> SBOM -> push ->
+//  deploy staging -> approval -> deploy prod -> post/notify/cleanup
+//
+//  Requires credentials:  github-ssh, dockerhub-creds, sonar-token, deploy-key
+//  Agents: label 'linux' (git, trivy, gitleaks) and label 'docker' (docker socket)
+// ============================================================================
+pipeline {
+
+    agent none
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        timeout(time: 45, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '50', artifactNumToKeepStr: '10'))
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        choice       name: 'DEPLOY_ENV',    choices: ['none', 'staging', 'prod'], description: 'Deploy target'
+        booleanParam name: 'RUN_SCANS',     defaultValue: true,  description: 'Run security scans'
+        booleanParam name: 'PUSH_IMAGE',    defaultValue: true,  description: 'Push image to Docker Hub'
+        string       name: 'COVERAGE_MIN',  defaultValue: '70',  description: 'Coverage gate (%)'
+    }
+
+    triggers {
+        pollSCM('H/10 * * * *')
+        cron('H 3 * * *')
+    }
+
+    environment {
+        APP_NAME          = 'python-app'
+        APP_PORT          = '5000'
+        DOCKER_USER       = 'REPLACE_ME'        // <-- your Docker Hub namespace
+        IMAGE             = "${DOCKER_USER}/${APP_NAME}"
+        REGISTRY          = 'https://index.docker.io/v1/'
+        REGISTRY_CREDS    = 'dockerhub-creds'
+        VENV              = 'venv'
+        PIP_CACHE_DIR     = '/var/lib/jenkins/.cache/pip'
+        SONAR_PROJECT_KEY = 'python-app'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            agent { label 'linux' }
+            steps {
+                dir(APP_NAME) { checkout scm }
+                script {
+                    dir(APP_NAME) {
+                        env.GIT_SHA    = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                        env.GIT_AUTHOR = sh(script: "git log -1 --pretty=format:'%an'", returnStdout: true).trim()
+                    }
+                    currentBuild.description = "${env.BRANCH_NAME ?: 'branch'} · ${env.GIT_SHA}"
+                    echo "Building ${APP_NAME} @ ${env.GIT_SHA} by ${env.GIT_AUTHOR}"
+                }
+            }
+        }
+
+        stage('Quality & Security') {
+            when { expression { params.RUN_SCANS } }
+            failFast false
+            parallel {
+
+                stage('Build') {
+                    agent { docker { image 'python:3.12-slim'; reuseNode true } }
+                    steps {
+                        dir(APP_NAME) {
+                            sh '''
+                                python -m venv $VENV
+                                . $VENV/bin/activate
+                                pip install --upgrade pip
+                                pip install -r requirements-dev.txt
+                            '''
+                        }
+                    }
+                }
+
+                stage('Lint · flake8') {
+                    agent { docker { image 'python:3.12-slim'; reuseNode true } }
+                    steps {
+                        dir(APP_NAME) {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                sh '. $VENV/bin/activate && flake8 app.py tests/'
+                            }
+                        }
+                    }
+                }
+
+                stage('SAST · Bandit') {
+                    agent { docker { image 'python:3.12-slim'; reuseNode true } }
+                    steps {
+                        dir(APP_NAME) {
+                            sh '. $VENV/bin/activate && bandit -r app.py -f json -o bandit-report.json || true'
+                            sh '. $VENV/bin/activate && bandit -r app.py -ll'   // fail on MEDIUM+
+                        }
+                    }
+                    post { always { archiveArtifacts artifacts: 'python-app/bandit-report.json', allowEmptyArchive: true } }
+                }
+
+                stage('SCA · pip-audit') {
+                    agent { docker { image 'python:3.12-slim'; reuseNode true } }
+                    steps {
+                        dir(APP_NAME) {
+                            sh '. $VENV/bin/activate && pip-audit -r requirements.txt --format json --output pip-audit.json || true'
+                            sh '. $VENV/bin/activate && pip-audit -r requirements.txt'      // blocking gate
+                        }
+                    }
+                    post { always { archiveArtifacts artifacts: 'python-app/pip-audit.json', allowEmptyArchive: true } }
+                }
+
+                stage('Secrets · gitleaks') {
+                    agent { label 'linux' }
+                    steps { sh 'gitleaks detect --source . --redact' }
+                }
+            }
+        }
+
+        stage('Build (fallback)') {
+            when { not { expression { params.RUN_SCANS } } }
+            agent { docker { image 'python:3.12-slim'; reuseNode true } }
+            steps {
+                dir(APP_NAME) {
+                    sh '''
+                        python -m venv $VENV
+                        . $VENV/bin/activate
+                        pip install --upgrade pip
+                        pip install -r requirements-dev.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Test') {
+            agent { docker { image 'python:3.12-slim'; reuseNode true } }
+            steps {
+                dir(APP_NAME) {
+                    sh ". $VENV/bin/activate && pytest --cov-fail-under=${params.COVERAGE_MIN}"
+                }
+            }
+        }
+
+        stage('SAST · SonarQube') {
+            agent { label 'linux' }
+            when { anyOf { branch 'main'; branch 'develop'; changeRequest() } }
+            steps { dir(APP_NAME) { withSonarQubeEnv('sonar') { sh 'sonar-scanner' } } }
+        }
+
+        stage('Quality Gate') {
+            agent { label 'linux' }
+            when { anyOf { branch 'main'; branch 'develop'; changeRequest() } }
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    script {
+                        def qg = waitForQualityGate()
+                        echo "Quality gate: ${qg.status}"
+                        if (qg.status != 'OK') { error "SonarQube quality gate failed: ${qg.status}" }
+                    }
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            agent { label 'docker' }
+            steps { dir(APP_NAME) { script { app = docker.build("${IMAGE}:${env.GIT_SHA}", '--pull .') } } }
+        }
+
+        stage('Container Smoke Test') {
+            agent { label 'docker' }
+            steps {
+                script {
+                    def port = 5000 + env.EXECUTOR_NUMBER.toInteger()
+                    app.inside("-p ${port}:5000 -e PORT=5000") {
+                        retry(10) { sleep 3; sh "curl -fsS http://localhost:${port}/health || exit 1" }
+                    }
+                }
+            }
+        }
+
+        stage('Image Scan · Trivy') {
+            agent { label 'docker' }
+            when { expression { params.RUN_SCANS } }
+            steps {
+                sh "trivy image --format table --output trivy-image.txt --severity HIGH,CRITICAL ${IMAGE}:${env.GIT_SHA} || true"
+                sh "trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed ${IMAGE}:${env.GIT_SHA}"
+            }
+            post { always { archiveArtifacts artifacts: 'trivy-image.txt', allowEmptyArchive: true } }
+        }
+
+        stage('SBOM') {
+            agent { label 'docker' }
+            steps {
+                sh "syft ${IMAGE}:${env.GIT_SHA} -o cyclonedx-json=sbom.cdx.json || trivy image --format cyclonedx --output sbom.cdx.json ${IMAGE}:${env.GIT_SHA}"
+                archiveArtifacts artifacts: 'sbom.cdx.json', fingerprint: true
+            }
+        }
+
+        stage('Push to Docker Hub') {
+            agent { label 'docker' }
+            when {
+                allOf {
+                    expression { params.PUSH_IMAGE }
+                    anyOf { branch 'main'; branch 'develop' }
+                }
+            }
+            steps {
+                script {
+                    docker.withRegistry(env.REGISTRY, env.REGISTRY_CREDS) {
+                        app.push(env.GIT_SHA)
+                        app.push(env.BUILD_NUMBER)
+                        if (env.BRANCH_NAME == 'main') { app.push('latest') }
+                    }
+                }
+            }
+        }
+
+        stage('Deploy · staging') {
+            agent { label 'linux' }
+            when { allOf { branch 'main'; expression { params.DEPLOY_ENV != 'none' } } }
+            steps {
+                sshagent(credentials: ['deploy-key']) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ubuntu@staging.example.com '
+                            set -e
+                            cd /opt/${APP_NAME}
+                            export IMAGE_REPO=${IMAGE} IMAGE_TAG=${GIT_SHA}
+                            docker compose pull && docker compose up -d --remove-orphans
+                            curl -fsS --retry 15 --retry-delay 2 http://localhost:${APP_PORT}/health
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Approve production') {
+            agent none
+            when { allOf { beforeAgent true; branch 'main'; expression { params.DEPLOY_ENV == 'prod' } } }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    script {
+                        def approval = input(
+                            id: 'ProdDeploy',
+                            message: "Deploy ${IMAGE}:${env.GIT_SHA} to PRODUCTION?",
+                            ok: 'Ship it',
+                            submitter: 'release-managers,admins',
+                            submitterParameter: 'APPROVER'
+                        )
+                        env.APPROVER = approval['APPROVER']
+                        echo "Approved by ${env.APPROVER}"
+                    }
+                }
+            }
+        }
+
+        stage('Deploy · production') {
+            agent { label 'linux' }
+            when { allOf { branch 'main'; expression { params.DEPLOY_ENV == 'prod' } } }
+            steps {
+                lock(resource: 'deploy-prod') {
+                    milestone 1
+                    sshagent(credentials: ['deploy-key']) {
+                        sh """
+                            ssh -o StrictHostKeyChecking=no ubuntu@prod.example.com '
+                                set -e
+                                cd /opt/${APP_NAME}
+                                export IMAGE_REPO=${IMAGE} IMAGE_TAG=${GIT_SHA}
+                                docker compose pull && docker compose up -d --remove-orphans
+                                curl -fsS --retry 20 --retry-delay 3 http://localhost:${APP_PORT}/health
+                            '
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            dir(APP_NAME) {
+                junit testResults: 'reports/junit.xml', allowEmptyResults: true
+                recordCoverage tools: [[parser: 'COBERTURA', pattern: 'coverage.xml']],
+                               sourceCodeRetention: 'LAST_BUILD'
+            }
+            archiveArtifacts artifacts: '**/reports/**,**/htmlcov/**,**/bandit-report.json,**/pip-audit.json,**/sbom.cdx.json',
+                             allowEmptyArchive: true, fingerprint: true
+        }
+        success   { echo "✅ ${IMAGE}:${env.GIT_SHA}" }
+        unstable  { echo "⚠️  Built, but quality gates were not met: ${env.BUILD_URL}" }
+        failure   { echo "❌ FAILED — ${env.BUILD_URL}" }
+        fixed     { echo "🎉 Back to green" }
+        regression{ echo "🔥 Regression — this branch used to pass" }
+        cleanup   {
+            node('linux') {
+                sh 'rm -rf python-app/venv || true'
+                sh 'docker image prune -f || true'
+                cleanWs()
+            }
+        }
+    }
+}

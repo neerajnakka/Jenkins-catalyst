@@ -1,0 +1,315 @@
+<section class="block" id="block-16" data-block="16" data-title="DevSecOps · SAST (SonarQube)">
+    <div class="bhead"><div class="bnum">16</div><div>
+      <div class="bl">Block 16 · DevSecOps &amp; scale</div>
+      <h2>DevSecOps part 1 — SAST with SonarQube</h2>
+      <p class="bgoal"><b>Goal:</b> automatically analyse code quality and security on every commit, and have a <em>quality gate</em> decide whether the build may proceed. This is the block that turns a CI engineer into a DevSecOps engineer.</p>
+    </div></div>
+
+    <h3><span class="hn">16.1</span> What SAST actually is</h3>
+    <div class="grid2">
+      <div class="card"><h5>🔬 SAST — Static Application Security Testing</h5><p>Reads your <strong>source code</strong> without running it. Finds SQL injection patterns, hardcoded secrets, null dereferences, and code smells. Runs in seconds, early in CI.</p></div>
+      <div class="card"><h5>🎯 Quality Gate</h5><p>A pass/fail policy: "coverage ≥ 70%", "zero blocker issues", "duplication &lt; 3%". The gate is what makes scanning matter — a report nobody enforces is decoration.</p></div>
+    </div>
+    <div class="info"><span class="lbl"><span class="ic">🧭</span>Where the pieces sit in the pipeline</span>
+    <strong>SAST (Block 16)</strong> → source code · <strong>SCA (Block 17)</strong> → your dependencies · <strong>Container + DAST (Block 18)</strong> → the built image and the running app. Together they cover the three places bugs and vulnerabilities hide.</div>
+
+    <h3><span class="hn">16.2</span> Run SonarQube locally (or on the EC2 box)</h3>
+    <div class="code" data-lang="yaml"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">yaml</span><span class="fn">jenkins/sonarqube/docker-compose.yml</span><button class="copy">📋 Copy</button></div><pre><code>version: "3.8"
+services:
+  sonarqube:
+    image: sonarqube:lts-community
+    container_name: sonarqube
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_logs:/opt/sonarqube/logs
+      - sonarqube_extensions:/opt/sonarqube/extensions
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+volumes:
+  sonarqube_data:
+  sonarqube_logs:
+  sonarqube_extensions:</code></pre></div>
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Start it and do the first-time setup</span><button class="copy">📋 Copy</button></div><pre><code>cd jenkins/sonarqube
+docker compose up -d
+docker compose logs -f sonarqube        # wait for "SonarQube is operational"
+
+# Browser: http://&lt;EC2-IP&gt;:9000   ->  login admin / admin  ->  CHANGE THE PASSWORD</code></pre></div>
+    <ol class="steps">
+      <li><strong>Create a project</strong> in SonarQube: <em>Projects → Create Project → Manually</em> → project key must match <code>sonar.projectKey</code> in your <span class="path">sonar-project.properties</span> → <code>nodejs-app</code> / <code>python-app</code>.</li>
+      <li><strong>Generate a token:</strong> <em>My Account → Security</em> → name <code>jenkins</code> → Generate. Copy it once.</li>
+      <li><strong>Store it in Jenkins:</strong> Credentials → <em>Secret text</em> → ID <code>sonar-token</code>.</li>
+      <li><strong>Configure the server:</strong> Manage Jenkins → System → <em>SonarQube servers</em> → Add: Name <code>sonar</code>, Server URL <span class="path">http://&lt;EC2-IP&gt;:9000</span>, Server authentication token → <code>sonar-token</code>.</li>
+      <li><strong>Configure the scanner tool:</strong> Manage Jenkins → Tools → <em>SonarQube Scanner installations</em> → Add <code>sonar-scanner</code> → Install automatically (latest).</li>
+    </ol>
+
+    <h3><span class="hn">16.3</span> The Jenkins pipeline steps</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">withSonarQubeEnv + waitForQualityGate</span><button class="copy">📋 Copy</button></div><pre><code>stage('SonarQube Analysis') {
+    agent { label 'linux' }
+    steps {
+        withSonarQubeEnv('sonar') {          // injects SONAR_HOST_URL + SONAR_AUTH_TOKEN
+            sh '''
+                sonar-scanner \
+                  -Dsonar.projectKey=nodejs-app \
+                  -Dsonar.sources=src \
+                  -Dsonar.tests=tests \
+                  -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+            '''
+        }
+    }
+}
+
+stage('Quality Gate') {
+    agent { label 'linux' }
+    steps {
+        // SonarQube analyses asynchronously -> wait for the webhook callback
+        timeout(time: 5, unit: 'MINUTES') {
+            script {
+                def qg = waitForQualityGate()
+                echo "Quality gate status: ${qg.status}"
+                if (qg.status != 'OK') {
+                    error "SonarQube quality gate failed: ${qg.status}"
+                }
+            }
+        }
+    }
+}</code></pre></div>
+
+    <div class="dang"><span class="lbl"><span class="ic">🚨</span>The #1 SonarQube-in-Jenkins mistake</span>
+    <code>waitForQualityGate()</code> waits for SonarQube to <strong>call Jenkins back</strong>. If you don't create that webhook, the step hangs until your timeout expires. Add it in SonarQube:
+    <div class="code" data-lang="bash" style="margin:10px 0 0"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">ui</span><span class="fn">SonarQube → Administration → Configuration → Webhooks</span><button class="copy">📋 Copy</button></div><pre><code>Name : jenkins
+URL  : http://&lt;JENKINS-IP&gt;:8080/sonarqube-webhook/</code></pre></div>
+    Note the path is <span class="path">/sonarqube-webhook/</span> (provided by the SonarQube Scanner plugin), not <span class="path">/github-webhook/</span>.</div>
+
+    <h3><span class="hn">16.4</span> The config file both apps already have</h3>
+    <div class="tabs">
+      <div class="tabbar">
+        <button class="tab on" data-t="ns">🟩 nodejs-app/sonar-project.properties</button>
+        <button class="tab" data-t="ps">🐍 python-app/sonar-project.properties</button>
+      </div>
+      <div class="tabpane on" data-t="ns">
+        <div class="code" data-lang="properties"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">properties</span><span class="fn">nodejs-app/sonar-project.properties</span><button class="copy">📋 Copy</button></div><pre><code>sonar.projectKey=nodejs-app
+sonar.projectName=nodejs-app
+sonar.projectVersion=1.0.0
+
+sonar.sources=src
+sonar.tests=tests
+sonar.sourceEncoding=UTF-8
+
+# coverage produced by `npm run test:junit`
+sonar.javascript.lcov.reportPaths=coverage/lcov.info
+
+sonar.exclusions=node_modules/**,coverage/**,reports/**</code></pre></div>
+      </div>
+      <div class="tabpane" data-t="ps">
+        <div class="code" data-lang="properties"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">properties</span><span class="fn">python-app/sonar-project.properties</span><button class="copy">📋 Copy</button></div><pre><code>sonar.projectKey=python-app
+sonar.projectName=python-app
+sonar.projectVersion=1.0.0
+
+sonar.sources=app.py
+sonar.tests=tests
+sonar.sourceEncoding=UTF-8
+
+sonar.python.coverage.reportPaths=coverage.xml
+sonar.python.flake8.reportPaths=flake8-report.txt
+sonar.python.bandit.reportPaths=bandit-report.json
+
+sonar.exclusions=venv/**,.venv/**,htmlcov/**,reports/**</code></pre></div>
+      </div>
+    </div>
+    <p>With this file present you can run the scanner with <strong>no arguments at all</strong> — it reads the properties automatically:</p>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Shortest possible analysis step</span><button class="copy">📋 Copy</button></div><pre><code>withSonarQubeEnv('sonar') {
+    sh 'sonar-scanner'
+}</code></pre></div>
+
+    <h3><span class="hn">16.5</span> Fail fast — or warn only?</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Approach</th><th>Code</th><th>Use when</th></tr></thead>
+      <tbody>
+        <tr><td>Hard gate</td><td><code>error "gate failed"</code></td><td>Release branches, mature codebase</td></tr>
+        <tr><td>Soft gate</td><td><code>catchError(buildResult:'UNSTABLE', stageResult:'FAILURE')</code></td><td>Introducing scanning to a legacy repo — don't block the team on day one</td></tr>
+        <tr><td>Report only</td><td>No gate step, dashboard only</td><td>Initial rollout / visibility phase</td></tr>
+      </tbody>
+    </table></div>
+    <div class="tip"><span class="lbl"><span class="ic">📈</span>How to roll out scanning without being hated</span>
+    Week 1: <strong>report only</strong>, publish the dashboard. Week 2: <strong>soft gate</strong> (unstable) so people see yellow. Week 3+: <strong>hard gate on new code only</strong> — SonarQube's "new code" period means you never inherit a decade of technical debt as a CI blocker, you just refuse to add to it. That nuance is a strong interview answer.</div>
+
+    <h3><span class="hn">16.6</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>SonarQube running at :9000 and both projects created.</li>
+      <li><code>sonar-token</code> credential + <code>sonar</code> server configured in Jenkins.</li>
+      <li><span class="path">/sonarqube-webhook/</span> registered in SonarQube.</li>
+      <li>Both pipelines show a <em>Quality Gate</em> stage that passes.</li>
+      <li>I broke the gate on purpose (dropped coverage) and watched the build fail.</li>
+    </ul>
+
+    <h3><span class="hn">16.7</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>How do you integrate SonarQube with Jenkins?</div><div class="a">Install the SonarQube Scanner plugin, configure the server and its token credential, and add a stage wrapping <code>sonar-scanner</code> in <code>withSonarQubeEnv('sonar')</code>. Then a second stage calls <code>waitForQualityGate()</code> inside a timeout, which pauses until SonarQube posts the gate result back to <span class="path">/sonarqube-webhook/</span>. Non-OK status fails the build.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>Why does <code>waitForQualityGate</code> hang?</div><div class="a">Because SonarQube analyses asynchronously and notifies Jenkins via a webhook. If the webhook isn't configured (or Jenkins isn't reachable from SonarQube), the step waits until the timeout. Wrapping it in <code>timeout()</code> turns that into a clean failure instead of a stuck build.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>How do you introduce quality gates to a legacy codebase with thousands of issues?</div><div class="a">Apply the gate to <strong>new code only</strong> — SonarQube's new-code period. Existing debt stays visible on the dashboard but doesn't block delivery, while every new line must be clean. Debt then shrinks naturally instead of blocking the team.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>SAST vs SCA vs DAST?</div><div class="a">SAST analyses my own source without executing it (SonarQube, Bandit, ESLint security rules). SCA analyses third-party dependencies for known CVEs (npm audit, pip-audit, OWASP Dependency-Check, Trivy fs). DAST attacks the <em>running</em> application over HTTP (OWASP ZAP) and finds runtime issues like missing security headers or misconfigured cookies.</div></div>
+    </div>
+
+<h3><span class="hn">16.8</span> Under the hood — the analysis round trip</h3>
+<figure><pre class="ascii">
+  JENKINS                                 SONARQUBE
+  ┌──────────────────────┐                ┌──────────────────────┐
+  │ withSonarQubeEnv()   │                │                      │
+  │  injects             │                │                      │
+  │  SONAR_HOST_URL      │                │                      │
+  │  SONAR_AUTH_TOKEN    │                │                      │
+  │          │           │                │                      │
+  │          ▼           │   1. submit    │                      │
+  │   sonar-scanner ─────┼───────────────▶│  compute engine      │
+  │          │           │                │  (async analysis)    │
+  │          ▼           │                │         │            │
+  │ waitForQualityGate() │                │         ▼            │
+  │  (pauses)       ◀────┼────────────────│  POST /sonarqube-    │
+  │                      │   2. webhook   │  webhook/            │
+  └──────────────────────┘                └──────────────────────┘</pre>
+<figcaption>Figure 16.1 — Analysis is asynchronous; the webhook is the only thing that unblocks the gate.</figcaption></figure>
+<p>Because analysis happens on the SonarQube server, <code>waitForQualityGate()</code> must block until the callback arrives. If the webhook cannot reach Jenkins — wrong URL, firewall, self-signed certificate — the step waits for your timeout and then fails. That is why the timeout matters as much as the webhook itself.</p>
+
+<h3><span class="hn">16.9</span> What SonarQube actually measures</h3>
+<div class="tw"><table>
+<thead><tr><th>Metric</th><th>What it is</th><th>Typical gate</th></tr></thead>
+<tbody>
+<tr><td><strong>Reliability</strong></td><td>Bugs — code that is demonstrably wrong</td><td>0 new bugs</td></tr>
+<tr><td><strong>Security</strong></td><td>Vulnerabilities (injection, weak crypto…)</td><td>0 new vulnerabilities</td></tr>
+<tr><td><strong>Security Hotspots</strong></td><td>Security-relevant code needing human review</td><td>Reviewed, not necessarily fixed</td></tr>
+<tr><td><strong>Maintainability</strong></td><td>Code smells + technical debt ratio</td><td>Debt ratio &lt; 5%</td></tr>
+<tr><td><strong>Coverage</strong></td><td>Line/branch coverage from your reports</td><td>≥ 70% on new code</td></tr>
+<tr><td><strong>Duplication</strong></td><td>Copied blocks</td><td>&lt; 3% on new code</td></tr>
+</tbody>
+</table></div>
+<div class="code" data-lang="properties"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">properties</span><span class="fn">Useful extra SonarQube properties</span><button class="copy">📋 Copy</button></div><pre><code># Analyse only the code you touched (great for legacy repos)
+sonar.newCode.referenceBranch=main
+
+# Monorepo: one project per app, each with its own key
+sonar.projectKey=nodejs-app
+
+# Exclude generated / third-party code
+sonar.exclusions=**/node_modules/**,**/coverage/**,**/dist/**,**/*.min.js
+
+# Treat tests as tests (affects coverage denominators)
+sonar.tests=tests
+sonar.test.inclusions=**/*.test.js,**/test_*.py</code></pre></div>
+
+<h3><span class="hn">16.10</span> Lab — fail the gate on purpose</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 16.1 · Prove the gate blocks</span>
+<strong>1.</strong> Add obvious problems to <span class="path">src/routes/items.js</span> — an unused variable, an empty <code>if</code>, and a duplicated block. Push to <code>main</code>.
+<div class="code" data-lang="javascript"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">javascript</span><span class="fn">Deliberately bad code</span><button class="copy">📋 Copy</button></div><pre><code>router.get('/', (req, res) =&gt; {
+  const unused = 'I am never read';           // code smell
+  if (req.query.done === undefined) { }       // empty block -&gt; maintainability issue
+  const result = items;                        // duplication candidate
+  const result2 = items;
+  res.status(200).json({ count: result.length, items: result2 });
+});</code></pre></div>
+<strong>2.</strong> Watch the pipeline: <em>SAST</em> succeeds because the analysis was uploaded, then <em>Quality Gate</em> fails with <code>ERROR</code>.
+<br/><strong>3.</strong> Open the SonarQube project UI and read the issues — the pipeline links straight to it.
+<br/><strong>4.</strong> Revert, push, confirm green. You now know the gate really does block.</div>
+
+<h3><span class="hn">16.11</span> SonarQube vs SonarCloud vs alternatives</h3>
+<div class="tw"><table>
+<thead><tr><th>Option</th><th>Hosting</th><th>Cost</th><th>Choose when</th></tr></thead>
+<tbody>
+<tr><td><strong>SonarQube Community</strong></td><td>Self-hosted (our docker-compose)</td><td>Free</td><td>Learning, small teams — note: no branch/PR analysis in the free edition</td></tr>
+<tr><td><strong>SonarQube Developer+</strong></td><td>Self-hosted</td><td>Paid</td><td>You need branch and PR analysis, portfolio views</td></tr>
+<tr><td><strong>SonarCloud</strong></td><td>SaaS</td><td>Free for public repos</td><td>Open source, or you don't want to run a server</td></tr>
+<tr><td><strong>Semgrep / CodeQL</strong></td><td>CLI or SaaS</td><td>Free tiers</td><td>Security-rule-focused scanning and custom rules</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">16.12</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q5</span>How is SonarQube different from a linter?</div><div class="a">A linter catches style and simple bugs in one file. SonarQube maintains a project-wide model over time: cross-file duplication, coverage imported from your test reports, security hotspots, and — critically — a <em>quality gate</em> policy with trends and a new-code period, so you can enforce standards without inheriting all historical debt.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q6</span>Why analyse "new code" only?</div><div class="a">Because applying today's standards to a ten-year-old codebase blocks delivery forever. The new-code period (since the last release, or a reference branch) means every change must be clean while existing debt stays visible and tracked separately — debt then shrinks naturally.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>Analysis succeeded but coverage shows 0% in SonarQube.</div><div class="a">Either the report path is wrong, or the report was generated after the scanner ran. The order must be: tests first, producing <span class="path">coverage/lcov.info</span> or <span class="path">coverage.xml</span>, then <code>sonar-scanner</code>, with <code>sonar.javascript.lcov.reportPaths</code> or <code>sonar.python.coverage.reportPaths</code> pointing at the real file.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>How do you keep the SonarQube token safe?</div><div class="a">It is stored as a secret-text credential in Jenkins and injected by <code>withSonarQubeEnv</code>, so it never appears in the Jenkinsfile or the console. I use a token per project or per team and rotate it on the same schedule as other CI credentials.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>How long should the quality gate wait?</div><div class="a">Typically two to five minutes; I use <code>timeout(time: 5, unit: 'MINUTES')</code>. Very large projects can exceed that, in which case I raise the timeout rather than remove the gate — a silent pass is far worse than a slow one.</div></div>
+</div>
+
+<h3><span class="hn">16.8</span> Under the hood — the analysis round trip</h3>
+<figure><pre class="ascii">
+  JENKINS                                 SONARQUBE
+  ┌──────────────────────┐                ┌──────────────────────┐
+  │ withSonarQubeEnv()   │                │                      │
+  │  injects             │                │                      │
+  │  SONAR_HOST_URL      │                │                      │
+  │  SONAR_AUTH_TOKEN    │                │                      │
+  │          │           │                │                      │
+  │          ▼           │   1. submit    │                      │
+  │   sonar-scanner ─────┼───────────────▶│  compute engine      │
+  │          │           │                │  (async analysis)    │
+  │          ▼           │                │         │            │
+  │ waitForQualityGate() │                │         ▼            │
+  │  (pauses)       ◀────┼────────────────│  POST /sonarqube-    │
+  │                      │   2. webhook   │  webhook/            │
+  └──────────────────────┘                └──────────────────────┘</pre>
+<figcaption>Figure 16.1 — Analysis is asynchronous; the webhook is the only thing that unblocks the gate.</figcaption></figure>
+<p>Because analysis happens on the SonarQube server, <code>waitForQualityGate()</code> must block until the callback arrives. If the webhook cannot reach Jenkins — wrong URL, firewall, self-signed certificate — the step waits for your timeout and then fails. That is why the timeout matters as much as the webhook itself.</p>
+
+<h3><span class="hn">16.9</span> What SonarQube actually measures</h3>
+<div class="tw"><table>
+<thead><tr><th>Metric</th><th>What it is</th><th>Typical gate</th></tr></thead>
+<tbody>
+<tr><td><strong>Reliability</strong></td><td>Bugs — code that is demonstrably wrong</td><td>0 new bugs</td></tr>
+<tr><td><strong>Security</strong></td><td>Vulnerabilities (injection, weak crypto…)</td><td>0 new vulnerabilities</td></tr>
+<tr><td><strong>Security Hotspots</strong></td><td>Security-relevant code needing human review</td><td>Reviewed, not necessarily fixed</td></tr>
+<tr><td><strong>Maintainability</strong></td><td>Code smells + technical debt ratio</td><td>Debt ratio &lt; 5%</td></tr>
+<tr><td><strong>Coverage</strong></td><td>Line/branch coverage from your reports</td><td>≥ 70% on new code</td></tr>
+<tr><td><strong>Duplication</strong></td><td>Copied blocks</td><td>&lt; 3% on new code</td></tr>
+</tbody>
+</table></div>
+<div class="code" data-lang="properties"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">properties</span><span class="fn">Useful extra SonarQube properties</span><button class="copy">📋 Copy</button></div><pre><code># Analyse only the code you touched (great for legacy repos)
+sonar.newCode.referenceBranch=main
+
+# Monorepo: one project per app, each with its own key
+sonar.projectKey=nodejs-app
+
+# Exclude generated / third-party code
+sonar.exclusions=**/node_modules/**,**/coverage/**,**/dist/**,**/*.min.js
+
+# Treat tests as tests (affects coverage denominators)
+sonar.tests=tests
+sonar.test.inclusions=**/*.test.js,**/test_*.py</code></pre></div>
+
+<h3><span class="hn">16.10</span> Lab — fail the gate on purpose</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 16.1 · Prove the gate blocks</span>
+<strong>1.</strong> Add obvious problems to <span class="path">src/routes/items.js</span> — an unused variable, an empty <code>if</code>, and a duplicated block. Push to <code>main</code>.
+<div class="code" data-lang="javascript"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">javascript</span><span class="fn">Deliberately bad code</span><button class="copy">📋 Copy</button></div><pre><code>router.get('/', (req, res) =&gt; {
+  const unused = 'I am never read';           // code smell
+  if (req.query.done === undefined) { }       // empty block -&gt; maintainability issue
+  const result = items;                        // duplication candidate
+  const result2 = items;
+  res.status(200).json({ count: result.length, items: result2 });
+});</code></pre></div>
+<strong>2.</strong> Watch the pipeline: <em>SAST</em> succeeds because the analysis was uploaded, then <em>Quality Gate</em> fails with <code>ERROR</code>.
+<br/><strong>3.</strong> Open the SonarQube project UI and read the issues — the pipeline links straight to it.
+<br/><strong>4.</strong> Revert, push, confirm green. You now know the gate really does block.</div>
+
+<h3><span class="hn">16.11</span> SonarQube vs SonarCloud vs alternatives</h3>
+<div class="tw"><table>
+<thead><tr><th>Option</th><th>Hosting</th><th>Cost</th><th>Choose when</th></tr></thead>
+<tbody>
+<tr><td><strong>SonarQube Community</strong></td><td>Self-hosted (our docker-compose)</td><td>Free</td><td>Learning, small teams — note: no branch/PR analysis in the free edition</td></tr>
+<tr><td><strong>SonarQube Developer+</strong></td><td>Self-hosted</td><td>Paid</td><td>You need branch and PR analysis, portfolio views</td></tr>
+<tr><td><strong>SonarCloud</strong></td><td>SaaS</td><td>Free for public repos</td><td>Open source, or you don't want to run a server</td></tr>
+<tr><td><strong>Semgrep / CodeQL</strong></td><td>CLI or SaaS</td><td>Free tiers</td><td>Security-rule-focused scanning and custom rules</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">16.12</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q5</span>How is SonarQube different from a linter?</div><div class="a">A linter catches style and simple bugs in one file. SonarQube maintains a project-wide model over time: cross-file duplication, coverage imported from your test reports, security hotspots, and — critically — a <em>quality gate</em> policy with trends and a new-code period, so you can enforce standards without inheriting all historical debt.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q6</span>Why analyse "new code" only?</div><div class="a">Because applying today's standards to a ten-year-old codebase blocks delivery forever. The new-code period (since the last release, or a reference branch) means every change must be clean while existing debt stays visible and tracked separately — debt then shrinks naturally.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>Analysis succeeded but coverage shows 0% in SonarQube.</div><div class="a">Either the report path is wrong, or the report was generated after the scanner ran. The order must be: tests first, producing <span class="path">coverage/lcov.info</span> or <span class="path">coverage.xml</span>, then <code>sonar-scanner</code>, with <code>sonar.javascript.lcov.reportPaths</code> or <code>sonar.python.coverage.reportPaths</code> pointing at the real file.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>How do you keep the SonarQube token safe?</div><div class="a">It is stored as a secret-text credential in Jenkins and injected by <code>withSonarQubeEnv</code>, so it never appears in the Jenkinsfile or the console. I use a token per project or per team and rotate it on the same schedule as other CI credentials.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>How long should the quality gate wait?</div><div class="a">Typically two to five minutes; I use <code>timeout(time: 5, unit: 'MINUTES')</code>. Very large projects can exceed that, in which case I raise the timeout rather than remove the gate — a silent pass is far worse than a slow one.</div></div>
+</div>
+</section>

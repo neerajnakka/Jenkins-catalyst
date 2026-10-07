@@ -1,0 +1,240 @@
+<section class="block" id="block-5" data-block="5" data-title="BUILD stage — Node &amp; Python">
+    <div class="bhead"><div class="bnum">05</div><div>
+      <div class="bl">Block 5 · Foundation</div>
+      <h2>BUILD stage — Node &amp; Python</h2>
+      <p class="bgoal"><b>Goal:</b> install dependencies deterministically and produce a build artifact. Understand why <em>deterministic</em> matters more than <em>fast</em>, and how caching changes the game.</p>
+    </div></div>
+
+    <h3><span class="hn">5.1</span> What "build" means per ecosystem</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Stack</th><th>Build =</th><th>Deterministic command</th><th>Lockfile (must be committed)</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Node.js</strong></td><td>Install dependencies into <code>node_modules</code></td><td><code>npm ci</code></td><td><span class="path">package-lock.json</span></td></tr>
+        <tr><td><strong>Python</strong></td><td>Create a venv, install dependencies</td><td><code>pip install -r requirements.txt</code></td><td><span class="path">requirements.txt</span> (pinned!) / <code>poetry.lock</code></td></tr>
+      </tbody>
+    </table></div>
+
+    <div class="dang"><span class="lbl"><span class="ic">🚨</span><code>npm install</code> vs <code>npm ci</code> — a guaranteed interview question</span>
+    <code>npm install</code> reads <span class="path">package.json</span> and may <strong>update the lockfile</strong> and install slightly newer versions. <code>npm ci</code> ("clean install") deletes <code>node_modules</code>, installs <em>exactly</em> what <span class="path">package-lock.json</span> says, and <strong>fails if the two disagree</strong>. CI must be reproducible — so CI always uses <code>npm ci</code>. Same reasoning for Python: pin your versions and use <code>pip install -r</code>.</div>
+
+    <h3><span class="hn">5.2</span> Why your build is slow, and the cache fix</h3>
+    <div class="grid2">
+      <div class="card"><h5>🟩 Node</h5><p>Downloads land in <span class="path">~/.npm</span>. Point <code>npm_config_cache</code> at a stable directory and <code>npm ci</code> becomes seconds on a warm agent.</p></div>
+      <div class="card"><h5>🐍 Python</h5><p>Wheels land in <span class="path">~/.cache/pip</span>. Keep it between builds and <code>pip install</code> skips the network entirely.</p></div>
+    </div>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Persistent caches on the agent</span><button class="copy">📋 Copy</button></div><pre><code>environment {
+    npm_config_cache = "${env.WORKSPACE_TMP}/.npm"     // or a fixed path: /var/lib/jenkins/.npm
+    PIP_CACHE_DIR    = "/var/lib/jenkins/.cache/pip"
+}</code></pre></div>
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>Cache in <span class="path">$WORKSPACE</span> only survives if you don't wipe it</span>
+    If you use <code>cleanBeforeCheckout()</code> (Block 4) or <code>cleanWs()</code>, anything cached inside the workspace is deleted. Use a path <strong>outside</strong> the workspace — e.g. <span class="path">/var/lib/jenkins/.npm</span> — for caches you want to keep.</div>
+
+    <h3><span class="hn">5.3</span> Exit codes: how Jenkins decides success</h3>
+    <p>A shell step succeeds when it exits <code>0</code>. Anything else fails the stage and the build. Three escape hatches:</p>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Controlling failure</span><button class="copy">📋 Copy</button></div><pre><code>// 1. Non-zero is fine -- give me the code instead of failing
+def rc = sh(script: 'npm audit --audit-level=high', returnStatus: true)
+echo "npm audit exit code: ${rc}"
+
+// 2. Capture output (trailing newline needs .trim())
+def nodeVersion = sh(script: 'node -v', returnStdout: true).trim()
+
+// 3. Force a failure with a clear message
+sh script: 'test -f package.json', label: 'verify manifest exists'
+if (!fileExists('package-lock.json')) {
+    error 'package-lock.json is missing -- `npm ci` cannot guarantee reproducibility'
+}</code></pre></div>
+
+    <h3><span class="hn">5.4</span> Stash &amp; unstash — moving files between agents</h3>
+    <p>If stage A runs on agent <code>linux</code> and stage B on agent <code>docker</code>, they do <strong>not</strong> share a workspace. <code>stash</code> saves files on the controller; <code>unstash</code> restores them wherever you need them.</p>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">stash / unstash</span><button class="copy">📋 Copy</button></div><pre><code>stage('Build') {
+    agent { label 'linux' }
+    steps {
+        sh 'npm ci --omit=dev'
+        stash name: 'app-source', includes: 'src/**,package*.json', useDefaultExcludes: true
+    }
+}
+stage('Package') {
+    agent { label 'docker' }
+    steps {
+        unstash 'app-source'          // files reappear here, on a different machine
+        sh 'docker build -t app .'
+    }
+}</code></pre></div>
+
+    <h3><span class="hn">5.5</span> ✍️ Jenkinsfiles v5 — real build stage</h3>
+    <div class="tabs">
+      <div class="tabbar">
+        <button class="tab on" data-t="n5">🟩 nodejs-app/Jenkinsfile</button>
+        <button class="tab" data-t="p5">🐍 python-app/Jenkinsfile</button>
+      </div>
+      <div class="tabpane on" data-t="n5">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">nodejs-app/Jenkinsfile — v5 (Build)</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+    options { timestamps(); timeout(time: 20, unit: 'MINUTES') }
+
+    environment {
+        APP_NAME       = 'nodejs-app'
+        npm_config_cache = '/var/lib/jenkins/.npm'      // cache OUTSIDE the workspace
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                dir(APP_NAME) {
+                    checkout scmGit(branches: [[name: '*/main']],
+                        extensions: [cleanBeforeCheckout()],
+                        userRemoteConfigs: [[credentialsId: 'github-ssh',
+                            url: 'git@github.com:&lt;you&gt;/jenkins-zero-to-hero.git']])
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                dir(APP_NAME) {
+                    sh label: 'verify toolchain', script: 'node -v &amp;&amp; npm -v'
+                    sh label: 'install dependencies', script: 'npm ci'
+                    // sanity gate: the app must actually load before we test it
+                    sh label: 'smoke import', script: "node -e \"require('./src/app.js'); console.log('app loads OK')\""
+                }
+            }
+        }
+
+        stage('Test') { steps { echo 'Block 6' } }
+    }
+
+    post { always { echo "Result: ${currentBuild.currentResult}" } }
+}</code></pre></div>
+      </div>
+      <div class="tabpane" data-t="p5">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">python-app/Jenkinsfile — v5 (Build)</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+    options { timestamps(); timeout(time: 20, unit: 'MINUTES') }
+
+    environment {
+        APP_NAME     = 'python-app'
+        PIP_CACHE_DIR = '/var/lib/jenkins/.cache/pip'
+        VENV_DIR     = 'venv'                    // venv INSIDE the workspace (cheap to rebuild)
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                dir(APP_NAME) {
+                    checkout scmGit(branches: [[name: '*/main']],
+                        extensions: [cleanBeforeCheckout()],
+                        userRemoteConfigs: [[credentialsId: 'github-ssh',
+                            url: 'git@github.com:&lt;you&gt;/jenkins-zero-to-hero.git']])
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                dir(APP_NAME) {
+                    sh label: 'verify toolchain', script: 'python3 --version'
+                    sh label: 'create virtualenv', script: 'python3 -m venv $VENV_DIR'
+                    sh label: 'install dependencies', script: '''
+                        . $VENV_DIR/bin/activate
+                        pip install --upgrade pip
+                        pip install -r requirements-dev.txt
+                    '''
+                    sh label: 'smoke import', script: '. $VENV_DIR/bin/activate &amp;&amp; python -c "import app; print(\'app loads OK\')"'
+                }
+            }
+        }
+
+        stage('Test') { steps { echo 'Block 6' } }
+    }
+
+    post { always { echo "Result: ${currentBuild.currentResult}" } }
+}</code></pre></div>
+      </div>
+    </div>
+    <div class="tip"><span class="lbl"><span class="ic">💡</span>Why the venv lives inside the workspace for Python</span>
+    A venv is cheap (milliseconds) and disposable — recreating it is faster and safer than sharing a mutable one between builds. Node's <code>node_modules</code> is the same idea; the <strong>expensive</strong> part is the download cache, and that's what we keep outside the workspace.</div>
+
+    <h3><span class="hn">5.6</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li><span class="path">package-lock.json</span> is committed (Node) and <span class="path">requirements*.txt</span> is pinned (Python).</li>
+      <li>Both pipelines show a green <strong>Build</strong> stage that prints the toolchain version.</li>
+      <li>I ran the build twice and the second run was faster (cache working).</li>
+      <li>I can explain in one sentence why CI uses <code>npm ci</code>.</li>
+    </ul>
+
+    <h3><span class="hn">5.7</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>What does your Build stage do?</div><div class="a">It installs dependencies deterministically from a committed lockfile (<code>npm ci</code> / pinned <code>requirements.txt</code>), verifies the toolchain, and does a smoke check that the app imports. It produces no side effects outside the workspace, so any failure is safe to retry.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>How do you speed up slow CI builds?</div><div class="a">Keep the package download cache outside the workspace so it survives <code>cleanWs</code> (<code>npm_config_cache</code>, <code>PIP_CACHE_DIR</code>), use shallow clones, cache base Docker layers with <code>--cache-from</code>, and split fast stages first so failures are discovered early.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>How do you share files between stages on different agents?</div><div class="a"><code>stash</code> on the producing agent and <code>unstash</code> on the consuming one — the controller holds the files. Alternatively publish to an artifact repository (Nexus, S3, ECR) for anything you need to keep.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>Your build passes locally but fails in Jenkins. Walk me through it.</div><div class="a">First reproduce as the Jenkins user with <code>sudo -u jenkins …</code>. Then compare: tool versions (<code>node -v</code>), lockfile committed, network access to the registry, filesystem permissions, and disk space. Then check the console log for the first <code>+ command</code> line that failed — not the last.</div></div>
+    </div>
+
+<h3><span class="hn">5.8</span> Under the hood — determinism and caches</h3>
+<p>A build is <strong>deterministic</strong> when the same commit always produces the same result. Three enemies of determinism, and the fix for each:</p>
+<div class="tw"><table>
+<thead><tr><th>Enemy</th><th>Symptom</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Floating version ranges</td><td><code>"express": "^4.19.2"</code> resolves differently next week</td><td>Commit the lockfile; use <code>npm ci</code> / pinned <code>requirements.txt</code></td></tr>
+<tr><td>Unpinned base images</td><td><code>FROM node:20</code> changes under you</td><td>Pin: <code>FROM node:20.17-alpine3.20</code></td></tr>
+<tr><td>System packages installed at build time</td><td><code>apt-get install curl</code> picks a new version</td><td>Pin versions, or bake them into a base image you control</td></tr>
+<tr><td>Time/locale dependent output</td><td>Snapshot tests fail around midnight</td><td>Set <code>TZ</code> and inject the clock in tests</td></tr>
+</tbody>
+</table></div>
+<div class="pull">Reproducibility is the whole point of CI. If a build can pass today and fail tomorrow on unchanged code, you don't have CI — you have a slot machine.<cite>Block 5</cite></div>
+
+<h4>Where caches live, and how long they survive</h4>
+<div class="tw"><table>
+<thead><tr><th>Cache</th><th>Path</th><th>Survives <code>cleanWs()</code>?</th></tr></thead>
+<tbody>
+<tr><td>npm</td><td><code>npm_config_cache=/var/lib/jenkins/.npm</code></td><td>✅ outside the workspace</td></tr>
+<tr><td>pip</td><td><code>PIP_CACHE_DIR=/var/lib/jenkins/.cache/pip</code></td><td>✅ outside the workspace</td></tr>
+<tr><td>Docker layers</td><td><span class="path">/var/lib/docker</span></td><td>✅ (until <code>docker system prune</code>)</td></tr>
+<tr><td>Maven / Gradle</td><td><span class="path">~/.m2</span>, <span class="path">~/.gradle</span></td><td>✅</td></tr>
+<tr><td><code>node_modules</code> / <code>venv</code></td><td>inside the workspace</td><td>❌ deleted — that's fine, they're cheap</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">5.9</span> Lab — measure what caching actually buys you</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 5.1 · Cold vs warm build</span>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Time it yourself, as the jenkins user</span><button class="copy">📋 Copy</button></div><pre><code>sudo -iu jenkins bash -c '
+  cd /tmp &amp;&amp; rm -rf cachetest &amp;&amp; mkdir cachetest &amp;&amp; cd cachetest
+  cp /var/lib/jenkins/jobs/nodejs-app/workspace/nodejs-app/package*.json . 2&gt;/dev/null || true
+
+  echo "--- COLD (empty cache) ---"
+  rm -rf /tmp/coldcache &amp;&amp; npm_config_cache=/tmp/coldcache npm ci --ignore-scripts
+  echo "--- WARM (same cache again) ---"
+  rm -rf node_modules &amp;&amp; time npm_config_cache=/tmp/coldcache npm ci --ignore-scripts
+'</code></pre></div>
+Expect the warm run to be 3–10× faster. That ratio is exactly what your pipeline gains by pointing <code>npm_config_cache</code> at a path outside the workspace.</div>
+
+<h3><span class="hn">5.10</span> Multi-ecosystem build reference</h3>
+<div class="tw"><table>
+<thead><tr><th>Task</th><th>Node.js</th><th>Python</th></tr></thead>
+<tbody>
+<tr><td>Install deps</td><td><code>npm ci</code></td><td><code>python -m venv venv &amp;&amp; . venv/bin/activate &amp;&amp; pip install -r requirements-dev.txt</code></td></tr>
+<tr><td>Prod-only install</td><td><code>npm ci --omit=dev</code></td><td><code>pip install -r requirements.txt</code></td></tr>
+<tr><td>Show the tree</td><td><code>npm ls --all</code></td><td><code>pip list</code> / <code>pipdeptree</code></td></tr>
+<tr><td>Smoke check</td><td><code>node -e "require('./src/app.js')"</code></td><td><code>python -c "import app"</code></td></tr>
+<tr><td>Produce an artifact</td><td><code>npm pack</code> → <span class="path">*.tgz</span></td><td><code>pip wheel . -w dist</code> → <span class="path">*.whl</span></td></tr>
+<tr><td>Cache dir</td><td><code>~/.npm</code></td><td><code>~/.cache/pip</code></td></tr>
+<tr><td>Lockfile</td><td><span class="path">package-lock.json</span></td><td><span class="path">requirements.txt</span> (pinned) / <code>poetry.lock</code></td></tr>
+</tbody>
+</table></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Publishing a build artifact (npm pack / wheel)</span><button class="copy">📋 Copy</button></div><pre><code>stage('Package artifact') {
+    steps {
+        dir('nodejs-app') {
+            sh 'npm pack'                                     // -> nodejs-app-1.0.0.tgz
+            archiveArtifacts artifacts: '*.tgz', fingerprint: true
+        }
+    }
+}</code></pre></div>
+
+<h3><span class="hn">5.11</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q5</span>What makes a CI build reproducible?</div><div class="a">A committed lockfile, a deterministic install command (<code>npm ci</code>), pinned base images and pinned system packages, plus an isolated environment (container or venv) so the agent's global state can't leak in.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q6</span>Where should CI caches live?</div><div class="a">Outside the workspace, at a stable absolute path like <span class="path">/var/lib/jenkins/.npm</span>. Anything inside the workspace is destroyed by <code>cleanWs()</code> and <code>cleanBeforeCheckout()</code>, so it can't act as a cache.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>When would you use <code>stash</code> instead of just leaving files in the workspace?</div><div class="a">When the next stage may run on a different agent — workspaces aren't shared across nodes, so <code>stash</code> copies the files via the controller. On a single agent, leaving them in place is faster.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>How do you fail fast in a build stage?</div><div class="a">Put a cheap smoke check right after install (does the module import?), and rely on <code>set -e</code> semantics: any non-zero exit aborts the stage. I add <code>label:</code> to each <code>sh</code> so the console shows exactly which command failed.</div></div>
+</div>
+</section>

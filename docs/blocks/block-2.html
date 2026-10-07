@@ -1,0 +1,363 @@
+<section class="block" id="block-2" data-block="2" data-title="Declarative Pipeline anatomy">
+    <div class="bhead"><div class="bnum">02</div><div>
+      <div class="bl">Block 2 · Foundation</div>
+      <h2>Declarative Pipeline anatomy</h2>
+      <p class="bgoal"><b>Goal:</b> be able to write the skeleton <code>pipeline → agent → stages → stage → steps → post</code> from memory, and know why each block exists and what order is legal.</p>
+    </div></div>
+
+    <h3><span class="hn">2.1</span> Two flavours: Declarative vs Scripted</h3>
+    <div class="grid2">
+      <div class="card"><h5>📐 Declarative <span class="pill p-must">Learn this</span></h5><p>Starts with <code>pipeline { }</code>. Fixed, opinionated structure. Jenkins can validate it, visualise it, and Blue Ocean can render it. Easy to read, hard to abuse. <strong>Use this 95% of the time.</strong></p></div>
+      <div class="card"><h5>🐍 Scripted</h5><p>Starts with <code>node { }</code>. Raw Groovy — loops, classes, try/catch anywhere. Maximum power, easy to make unreadable. Use it inside a <code>script { }</code> block when declarative genuinely can't express something.</p></div>
+    </div>
+    <div class="info"><span class="lbl"><span class="ic">🧠</span>The mental model</span>
+    Declarative says <em>what</em> should happen ("run these four stages, then always clean up"). Scripted says <em>how</em> ("do this Groovy, step by step"). Declarative pipelines are still Groovy underneath, which is why a syntax slip produces Groovy stack traces.</div>
+
+    <h3><span class="hn">2.2</span> The skeleton — every legal top-level block</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">The complete declarative skeleton (all sections, correct order)</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {                 // 1. REQUIRED. The whole file lives inside it.
+
+    agent any              // 2. REQUIRED. WHERE the pipeline runs.
+
+    options {              // 3. optional. Pipeline-wide behaviour.
+        timestamps()                                  // add timestamps to logs
+        timeout(time: 30, unit: 'MINUTES')            // kill runaway builds
+        buildDiscarder(logRotator(numToKeepStr: '30'))// keep disk sane
+        disableConcurrentBuilds()                     // one build at a time
+    }
+
+    parameters {           // 4. optional. Inputs the user fills before "Build".
+        choice(name: 'ENV', choices: ['dev','qa','prod'], description: 'Target')
+        booleanParam(name: 'RUN_TESTS', defaultValue: true)
+    }
+
+    triggers {             // 5. optional. WHAT starts the pipeline.
+        pollSCM('H/5 * * * *')   // check Git every 5 minutes
+    }
+
+    tools {                // 6. optional. Auto-install & put tools on PATH.
+        nodejs 'node20'
+    }
+
+    environment {          // 7. optional. Variables for every step.
+        APP_NAME = 'nodejs-app'
+    }
+
+    stages {               // 8. REQUIRED. The work.
+        stage('Build') {
+            steps {        //    REQUIRED inside a stage.
+                echo "Building ${APP_NAME}"
+                sh 'npm ci'
+            }
+        }
+    }
+
+    post {                 // 9. optional. Runs after stages, whatever happened.
+        always   { echo 'always' }
+        success  { echo 'green' }
+        failure  { echo 'red' }
+        cleanup  { echo 'last' }
+    }
+}</code></pre></div>
+
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>Four rules that cause 90% of "why won't my Jenkinsfile compile"</span>
+    <ol style="margin:0;padding-left:20px">
+      <li><code>pipeline</code>, <code>agent</code> and <code>stages</code> are <strong>mandatory</strong> at the top level.</li>
+      <li>Every <code>stage</code> must contain a <code>steps</code> block (or <code>parallel</code>/<code>matrix</code>/<code>when</code> variants).</li>
+      <li>Order matters at the top level: <code>agent</code> → <code>options</code> → <code>parameters</code> → <code>triggers</code> → <code>tools</code> → <code>environment</code> → <code>stages</code> → <code>post</code>.</li>
+      <li><code>stages</code> can contain only <code>stage</code> blocks — no naked <code>steps</code> floating inside it.</li>
+    </ol></div>
+
+    <h3><span class="hn">2.3</span> <code>agent</code> — where the work happens</h3>
+    <p><code>agent</code> answers one question: <em>on what machine, and inside what container, do these steps run?</em> Jenkins allocates a workspace and an executor there.</p>
+    <div class="tw"><table>
+      <thead><tr><th>Form</th><th>Meaning</th><th>When you use it</th></tr></thead>
+      <tbody>
+        <tr><td><code>agent any</code></td><td>Any available node/executor</td><td>Learning, single-server setups</td></tr>
+        <tr><td><code>agent none</code></td><td>No global agent — each <code>stage</code> declares its own</td><td>Mixing OSes/tools in one pipeline (Block 13)</td></tr>
+        <tr><td><code>agent { label 'docker' }</code></td><td>Run only on nodes labelled <code>docker</code></td><td>Routing builds to capable machines</td></tr>
+        <tr><td><code>agent { node { label 'linux'; customWorkspace '/data/ci' } }</code></td><td>Node + custom workspace path</td><td>Disk or path constraints</td></tr>
+        <tr><td><code>agent { docker { image 'node:20-alpine' } }</code></td><td>Run steps <em>inside</em> a container</td><td>Zero-install toolchains (Block 13)</td></tr>
+        <tr><td><code>agent { dockerfile { filename 'Dockerfile.ci'; args '-v /tmp:/tmp' } }</code></td><td>Build an image from a Dockerfile, run inside it</td><td>Reproducible build environments</td></tr>
+      </tbody>
+    </table></div>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">agent none + per-stage agents (the professional pattern)</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent none                       // no machine reserved for the whole pipeline
+    stages {
+        stage('Test on Node 20') {
+            agent { docker { image 'node:20-alpine' } }   // reserved just for this stage
+            steps { sh 'node -v &amp;&amp; npm test' }
+        }
+        stage('Build image') {
+            agent { label 'docker' }                      // needs the docker socket
+            steps { sh 'docker build -t app .' }
+        }
+    }
+}</code></pre></div>
+    <div class="tip"><span class="lbl"><span class="ic">💡</span>What <code>agent</code> really does</span>
+    It (1) picks a node by label, (2) grabs an executor slot, (3) creates/locks a workspace directory, and (4) for <code>docker</code>/<code>dockerfile</code>, starts a container and mounts that workspace inside it as the working directory. All later <code>sh</code> steps run there — which is why files created in one stage are visible in the next <em>on the same agent</em>.</div>
+
+    <h3><span class="hn">2.4</span> <code>stages</code>, <code>stage</code> and <code>steps</code></h3>
+    <ul>
+      <li><strong><code>stages</code></strong> is a container — it holds one or more <code>stage</code> blocks and nothing else.</li>
+      <li><strong><code>stage('Name')</code></strong> is a logical unit with a name shown in the UI. It is <em>not</em> a sandbox: it does not isolate files or change directories. It exists so you can see timing, pass/fail and rerun per unit.</li>
+      <li><strong><code>steps</code></strong> holds the actual commands. Steps are things Jenkins knows how to run: <code>sh</code>, <code>echo</code>, <code>git</code>, <code>junit</code>, <code>archiveArtifacts</code>.</li>
+    </ul>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Steps you will use constantly</span><button class="copy">📋 Copy</button></div><pre><code>steps {
+    echo 'Print a line to the console'                 // built-in
+    sh 'npm ci'                                        // run a shell command (Linux/macOS)
+    sh label: 'install deps', script: 'npm ci'         // with a nicer log label
+    sh returnStdout: true, script: 'git rev-parse --short HEAD'   // capture output
+    sh returnStatus: true, script: 'grep -q X file'    // get exit code without failing
+    bat 'mvn test'                                     // Windows
+    dir('python-app') { sh 'pytest' }                  // run inside a sub-directory
+    deleteDir()                                        // wipe the workspace
+    script {                                           // escape hatch: real Groovy
+        def v = sh(script: 'node -v', returnStdout: true).trim()
+        echo "Node version is ${v}"
+    }
+}</code></pre></div>
+
+    <h4>Single quotes vs double quotes — the #1 beginner bug</h4>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">GString interpolation</span><button class="copy">📋 Copy</button></div><pre><code>def TAG = 'v1.4'
+
+echo "Tag is ${TAG}"    // ✅ double quotes  -> "Tag is v1.4"   (GString, interpolates)
+echo 'Tag is ${TAG}'    // ❌ single quotes  -> "Tag is ${TAG}" (plain String, literal)</code></pre></div>
+
+    <h3><span class="hn">2.5</span> <code>post</code> — the cleanup &amp; notification block</h3>
+    <p><code>post</code> runs after all stages finish. Conditions are evaluated in a fixed order, and <strong>multiple conditions can run</strong> (e.g. <code>always</code> and <code>success</code> both fire on a green build).</p>
+    <div class="tw"><table>
+      <thead><tr><th>Condition</th><th>Runs when</th><th>Typical use</th></tr></thead>
+      <tbody>
+        <tr><td><code>always</code></td><td>Every time, no matter the result</td><td>Publish reports, clean workspace, notify</td></tr>
+        <tr><td><code>success</code></td><td>All stages passed</td><td>Slack "green", tag image as stable</td></tr>
+        <tr><td><code>failure</code></td><td>Any stage threw an error</td><td>Alert, attach log, open ticket</td></tr>
+        <tr><td><code>unstable</code></td><td>Build marked unstable (failed tests, quality gate)</td><td>Warn but don't page anyone</td></tr>
+        <tr><td><code>aborted</code></td><td>Someone cancelled it</td><td>Release locks, scale down</td></tr>
+        <tr><td><code>changed</code></td><td>Result differs from the previous build</td><td>"Back to green" messages</td></tr>
+        <tr><td><code>fixed</code></td><td>Failed before, success now</td><td>Celebrate, close incident</td></tr>
+        <tr><td><code>regression</code></td><td>Success before, failing now</td><td>Escalate immediately</td></tr>
+        <tr><td><code>unsuccessful</code></td><td>Not success (failure/unstable/aborted)</td><td>Generic alerting</td></tr>
+        <tr><td><code>cleanup</code></td><td><strong>Always, and last</strong> — after everything else</td><td>Delete temp files, stop containers</td></tr>
+      </tbody>
+    </table></div>
+    <p>Block 11 goes deep on <code>post</code>. For now, just wire up <code>always</code> and <code>failure</code>.</p>
+
+    <h3><span class="hn">2.6</span> ✍️ Your first real Jenkinsfiles (v2)</h3>
+    <p>Replace <span class="path">nodejs-app/Jenkinsfile</span> and <span class="path">python-app/Jenkinsfile</span> with these, commit, push, and run. Nothing fancy yet — the point is that the <strong>structure</strong> works and the UI shows four stages.</p>
+    <div class="tabs">
+      <div class="tabbar">
+        <button class="tab on" data-t="n2">🟩 nodejs-app/Jenkinsfile</button>
+        <button class="tab" data-t="p2">🐍 python-app/Jenkinsfile</button>
+      </div>
+      <div class="tabpane on" data-t="n2">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">nodejs-app/Jenkinsfile — v2</span><button class="copy">📋 Copy</button></div><pre><code>// ============================================================
+//  nodejs-app/Jenkinsfile  --  v2  (Block 2: anatomy)
+// ============================================================
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        timeout(time: 15, unit: 'MINUTES')
+    }
+
+    environment {
+        APP_NAME = 'nodejs-app'
+    }
+
+    stages {
+        stage('Info') {
+            steps {
+                echo "Building ${APP_NAME} - build #${env.BUILD_NUMBER}"
+                echo "Workspace: ${env.WORKSPACE}"
+                sh 'node -v &amp;&amp; npm -v'
+            }
+        }
+
+        stage('Build') {
+            steps {
+                echo 'Block 5 will install dependencies here'
+            }
+        }
+
+        stage('Test') {
+            steps {
+                echo 'Block 6 will run the Jest suite here'
+            }
+        }
+    }
+
+    post {
+        always  { echo "Finished with status: ${currentBuild.currentResult}" }
+        failure { echo 'Something broke - Block 11 will notify us properly' }
+    }
+}</code></pre></div>
+      </div>
+      <div class="tabpane" data-t="p2">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">python-app/Jenkinsfile — v2</span><button class="copy">📋 Copy</button></div><pre><code>// ============================================================
+//  python-app/Jenkinsfile  --  v2  (Block 2: anatomy)
+// ============================================================
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        timeout(time: 15, unit: 'MINUTES')
+    }
+
+    environment {
+        APP_NAME = 'python-app'
+    }
+
+    stages {
+        stage('Info') {
+            steps {
+                echo "Building ${APP_NAME} - build #${env.BUILD_NUMBER}"
+                echo "Workspace: ${env.WORKSPACE}"
+                sh 'python3 --version'
+            }
+        }
+
+        stage('Build') {
+            steps {
+                echo 'Block 5 will create the venv and install deps here'
+            }
+        }
+
+        stage('Test') {
+            steps {
+                echo 'Block 6 will run pytest here'
+            }
+        }
+    }
+
+    post {
+        always  { echo "Finished with status: ${currentBuild.currentResult}" }
+        failure { echo 'Something broke - Block 11 will notify us properly' }
+    }
+}</code></pre></div>
+      </div>
+    </div>
+
+    <ol class="steps">
+      <li><strong>Create the job:</strong> New Item → name <code>nodejs-app</code> → <strong>Pipeline</strong> → OK.</li>
+      <li><strong>Point it at Git:</strong> <em>Pipeline</em> section → Definition: <em>Pipeline script from SCM</em> → SCM: <em>Git</em> → Repository URL: your repo → <strong>Script Path: <code>nodejs-app/Jenkinsfile</code></strong>.</li>
+      <li><strong>Save → Build Now.</strong> Watch the Stage View fill in. Click any stage → <em>Logs</em> to see only that stage's output.</li>
+      <li><strong>Do it again</strong> for <code>python-app</code> with Script Path <code>python-app/Jenkinsfile</code>.</li>
+    </ol>
+    <div class="note"><span class="lbl"><span class="ic">📌</span>Note</span>Both jobs can share one Git repo — that's exactly how monorepos work. Each job reads a different Jenkinsfile path. We'll formalise this with Multibranch in Block 15.</div>
+
+    <h3><span class="hn">2.7</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>I can list the mandatory top-level blocks without looking.</li>
+      <li>Both jobs ran and showed 3 stages in the UI with per-stage timings.</li>
+      <li>I deliberately broke the syntax (removed <code>steps</code>) and read the resulting error.</li>
+      <li>I can explain what <code>agent any</code> actually allocates.</li>
+      <li>I know the difference between <code>"${VAR}"</code> and <code>'${VAR}'</code>.</li>
+    </ul>
+
+    <h3><span class="hn">2.8</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>Declarative vs Scripted pipeline — which do you use and why?</div><div class="a">Declarative. It has a fixed structure Jenkins can validate and visualise, it's readable for the whole team, and it prevents the "clever Groovy nobody can maintain" problem. I drop into <code>script { }</code> only when I genuinely need Groovy logic that declarative can't express.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>What are the mandatory sections of a declarative pipeline?</div><div class="a"><code>pipeline</code> at the root, and inside it <code>agent</code> and <code>stages</code>. Every <code>stage</code> must then contain a <code>steps</code> block.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>What does <code>agent none</code> mean?</div><div class="a">No agent is allocated for the pipeline as a whole; each stage declares its own agent. It lets one pipeline run tests inside a Node container and build an image on a Docker host, without holding two executors for the whole run.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>Do stages run in parallel by default?</div><div class="a">No — sequentially, in the order written. Parallelism is explicit with a <code>parallel</code> block (Block 21), and it still needs executors available.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q5</span>What's the difference between <code>always</code> and <code>cleanup</code> in <code>post</code>?</div><div class="a">Both always run, but <code>cleanup</code> runs <em>last</em>, after every other post condition — including after a failure in <code>always</code>. Anything that must happen even if notifications break (removing temp files, stopping containers) belongs in <code>cleanup</code>.</div></div>
+    </div>
+
+    <h3><span class="hn">2.9</span> 🔥 Common errors</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Error</th><th>Cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><code>No such DSL method 'stage' found among steps</code></td><td>A <code>stage</code> outside <code>stages</code>, or steps written directly in <code>stages</code></td><td>Wrap stages in <code>stages { }</code>; every stage needs <code>steps { }</code></td></tr>
+        <tr><td><code>Required context class hudson.FilePath is missing</code></td><td>Used a file step (e.g. <code>sh</code>) outside <code>steps</code>, typically in <code>post</code> at pipeline level without an agent</td><td>Put the step inside a <code>steps</code> block, or add <code>agent</code>/<code>node</code> scope</td></tr>
+        <tr><td><code>Missing required parameter: "agent"</code></td><td>You wrote <code>agent</code> with no value</td><td>Use <code>agent any</code>/<code>agent none</code>/<code>agent { label '…' }</code></td></tr>
+        <tr><td>Variable prints as <code>${VAR}</code> literally</td><td>Single-quoted string</td><td>Use double quotes for interpolation: <code>"${VAR}"</code></td></tr>
+        <tr><td><code>WorkflowScript: 3: expecting '}', found 'stages'</code></td><td>A missing brace or comma earlier in the file</td><td>Read the line number — the real mistake is usually a few lines above</td></tr>
+      </tbody>
+    </table></div>
+
+<h3><span class="hn">2.10</span> Under the hood — how a declarative pipeline actually runs</h3>
+<p>This is the most useful piece of Jenkins theory there is, and it explains errors that otherwise look random.</p>
+<ol class="steps">
+  <li><strong>Parse.</strong> The declarative structure is validated first — which is why a missing <code>steps</code> block fails instantly with a structural message instead of a Groovy stack trace.</li>
+  <li><strong>CPS transformation.</strong> Your Groovy is rewritten into <em>Continuation Passing Style</em> so the pipeline can be paused and resumed — that's what lets a build survive a controller restart.</li>
+  <li><strong>Execution.</strong> Steps dispatch: <code>sh</code> forks a process on the agent, <code>echo</code> writes to the build log, <code>junit</code> parses files on the controller, <code>docker.build</code> talks to the daemon.</li>
+  <li><strong>Durability.</strong> Program state is flushed to <span class="path">jobs/*/builds/&lt;n&gt;/program.dat</span> so a crash resumes from the last checkpoint.</li>
+</ol>
+<div class="info"><span class="lbl"><span class="ic">🧠</span>Why Groovy behaves oddly inside a pipeline</span>
+Because of CPS, some ordinary Groovy is unsafe: closures that mutate state, loops over non-serialisable objects, and certain collection methods. Annotate pure helper functions with <code>@NonCPS</code>:
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">@NonCPS — pure computation only, never steps</span><button class="copy">📋 Copy</button></div><pre><code>import com.cloudbees.groovy.cps.NonCPS
+
+@NonCPS
+String joinNames(List&lt;String&gt; names) { names.join(', ') }
+
+pipeline {
+    agent any
+    stages {
+        stage('Demo') {
+            steps {
+                script { echo joinNames(['jenkins', 'docker', 'sonar']) }
+            }
+        }
+    }
+}</code></pre></div>
+Rule: an <code>@NonCPS</code> method must never call a pipeline step (<code>sh</code>, <code>echo</code>), because it cannot be suspended.</div>
+
+<h4>Complete <code>options</code> reference</h4>
+<div class="tw"><table>
+<thead><tr><th>Option</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>buildDiscarder(logRotator(numToKeepStr:'30', artifactNumToKeepStr:'5', daysToKeepStr:'60'))</code></td><td>Caps history and artifacts — the disk safety net</td></tr>
+<tr><td><code>disableConcurrentBuilds()</code> / <code>disableConcurrentBuilds(abortPrevious:true)</code></td><td>Queue or cancel when a run is already in flight</td></tr>
+<tr><td><code>timeout(time:30, unit:'MINUTES')</code></td><td>Hard cap; result becomes ABORTED</td></tr>
+<tr><td><code>retry(2)</code></td><td>Rerun the whole pipeline on failure (prefer stage-level)</td></tr>
+<tr><td><code>timestamps()</code></td><td>Prefix every log line with elapsed and wall time</td></tr>
+<tr><td><code>ansiColor('xterm')</code></td><td>Render ANSI colour from npm/pytest output</td></tr>
+<tr><td><code>skipDefaultCheckout(true)</code></td><td>No implicit checkout; call <code>checkout scm</code> yourself</td></tr>
+<tr><td><code>skipStagesAfterUnstable()</code></td><td>Stop further stages once the build is unstable</td></tr>
+<tr><td><code>quietPeriod(5)</code></td><td>Wait N seconds before starting — coalesces commit bursts</td></tr>
+<tr><td><code>checkoutToSubdirectory('src')</code></td><td>Check out into a named subfolder</td></tr>
+<tr><td><code>newContainerPerStage()</code></td><td>With docker agents: a fresh container per stage</td></tr>
+<tr><td><code>preserveStashes()</code></td><td>Keep stashes after the run (debugging aid)</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">2.11</span> Lab — three deliberate syntax failures</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 2.1 · Read the error, fix the error</span>
+Run each in <strong>Replay</strong> and match the message to the cause.
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Fault 1 — steps directly inside stages</span><button class="copy">📋 Copy</button></div><pre><code>stages {
+    sh 'npm ci'      // ✗ No such DSL method 'sh' found among steps
+}</code></pre></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Fault 2 — single quotes kill interpolation</span><button class="copy">📋 Copy</button></div><pre><code>environment { T = '${BUILD_NUMBER}' }
+echo '${T}'      // prints literally: ${T}
+echo "${T}"      // prints: 42</code></pre></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Fault 3 — post block with agent none</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+  agent none
+  stages { stage('a') { agent any; steps { echo 'hi' } } }
+  post { always { sh 'echo bye' } }   // ✗ Required context class hudson.FilePath is missing
+}
+// Fix:  post { always { node('any') { sh 'echo bye' } } }</code></pre></div>
+</div>
+
+<h3><span class="hn">2.12</span> Production notes — pipeline hygiene</h3>
+<div class="tw"><table>
+<thead><tr><th>Habit</th><th>Why it pays off</th></tr></thead>
+<tbody>
+<tr><td>Every pipeline opens with <code>options { timestamps() timeout() buildDiscarder() }</code></td><td>Three lines prevent the three most common production incidents</td></tr>
+<tr><td>Name stages after <em>outcomes</em> ("Test", "Push"), not tools ("npm")</td><td>The stage view stays meaningful when you swap tooling</td></tr>
+<tr><td>Keep logic out of <code>script{}</code> where declarative works</td><td>Declarative is validated, visualised and safer</td></tr>
+<tr><td>One Jenkinsfile per app, never one mega-pipeline</td><td>Small blast radius, clear ownership, faster runs</td></tr>
+<tr><td>Label every meaningful <code>sh</code> with <code>label:</code></td><td>The console log stays readable at 2 a.m.</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">2.13</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>What is CPS in Jenkins pipelines?</div><div class="a">Continuation Passing Style: Groovy is transformed so execution can be paused and resumed, which is how a build survives a controller restart. It also explains why some ordinary Groovy misbehaves in pipelines and why pure helpers are annotated <code>@NonCPS</code>.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>Why do some Groovy methods fail inside a pipeline?</div><div class="a">CPS-transformed code must be serialisable and resumable. Collection methods with closures, <code>each</code> over non-serialisable objects and mutating shared state can throw <code>NotSerializableException</code>. I move that logic into an <code>@NonCPS</code> method or a shared-library class under <span class="path">src/</span>.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>Can a running pipeline survive a Jenkins restart?</div><div class="a">Yes, up to the configured durability level: program state is written to disk, so after a restart the build resumes at the last checkpoint and in-flight steps are re-run. That is a direct consequence of the CPS design.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>When do you use <code>script{}</code>?</div><div class="a">When declarative genuinely can't express the logic — building a dynamic parallel map, conditional loops, parsing JSON into variables, calling Groovy libraries. Everything else stays declarative so it can be validated and visualised.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q10</span>How do you keep Jenkinsfiles readable as they grow?</div><div class="a">Move reusable logic to a shared library, keep stages short and outcome-named, use <code>parameters</code> instead of hard-coded values, and set <code>currentBuild.description</code> so the history page explains itself. Past roughly 150 lines, the repeated parts belong in <span class="path">vars/</span>.</div></div>
+</div>
+</section>

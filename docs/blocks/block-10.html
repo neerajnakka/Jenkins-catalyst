@@ -1,0 +1,199 @@
+<section class="block" id="block-10" data-block="10" data-title="Webhooks &amp; triggers">
+    <div class="bhead"><div class="bnum">10</div><div>
+      <div class="bl">Block 10 · Real engineering</div>
+      <h2>Webhooks &amp; automatic triggers</h2>
+      <p class="bgoal"><b>Goal:</b> push code and see Jenkins start building within seconds — no human, no polling. Then understand every other trigger so you can pick the right one.</p>
+    </div></div>
+
+    <h3><span class="hn">10.1</span> Every way a build can start</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Trigger</th><th>How</th><th>Latency</th><th>When to use</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Manual</strong></td><td>Build Now button</td><td>instant</td><td>Learning, manual releases</td></tr>
+        <tr><td><strong>Webhook (push)</strong> ⭐</td><td>GitHub POSTs to Jenkins</td><td>1–3 s</td><td>The default for CI</td></tr>
+        <tr><td><strong>SCM polling</strong></td><td>Jenkins asks Git every N minutes</td><td>up to N min</td><td>When Jenkins can't be reached from the internet</td></tr>
+        <tr><td><strong>Cron</strong></td><td><code>triggers { cron('H 2 * * *') }</code></td><td>scheduled</td><td>Nightly builds, weekly security scans</td></tr>
+        <tr><td><strong>Upstream / downstream</strong></td><td><code>build job: 'other-pipeline'</code></td><td>instant</td><td>Pipeline chaining (build → deploy)</td></tr>
+        <tr><td><strong>Remote / API</strong></td><td>HTTP POST with a token</td><td>instant</td><td>External systems, GitHub Actions, cron boxes</td></tr>
+      </tbody>
+    </table></div>
+
+    <div class="info"><span class="lbl"><span class="ic">🧠</span>Webhook vs Polling — the classic interview question</span>
+    <strong>Polling</strong> = Jenkins asks "anything new?" every few minutes: always works (even behind NAT/firewall), but wastes API calls and delays builds. <strong>Webhooks</strong> = Git tells Jenkins the instant something happens: fast and efficient, but Jenkins must be reachable by GitHub. Rule of thumb: webhooks in production, polling as the fallback when the network forbids webhooks.</div>
+
+    <h3><span class="hn">10.2</span> Setting up the GitHub webhook</h3>
+    <ol class="steps">
+      <li><strong>Install the GitHub plugin</strong> (Manage Jenkins → Plugins → <em>GitHub</em>, id <code>github</code>). It creates the <span class="path">/github-webhook/</span> endpoint.</li>
+      <li><strong>Enable the trigger in the job:</strong> job → Configure → <em>Build Triggers</em> → tick <strong>GitHub hook trigger for GITScm polling</strong>. (For Multibranch: tick <em>Scan by webhook</em> and set a trigger token.)</li>
+      <li><strong>Create the webhook on GitHub:</strong> Repo → Settings → Webhooks → Add webhook:<br/>
+        <strong>Payload URL:</strong> <span class="path">http://&lt;JENKINS-IP&gt;:8080/github-webhook/</span> (note the trailing slash)<br/>
+        <strong>Content type:</strong> <code>application/json</code> · <strong>Secret:</strong> optional but recommended<br/>
+        <strong>Events:</strong> <em>Just the push event</em> (add <em>Pull requests</em> for Block 15)</li>
+      <li><strong>Test it:</strong> push a commit. In GitHub → Webhooks → <em>Recent Deliveries</em> you should see a green <code>200</code>. In Jenkins a new build appears within seconds.</li>
+    </ol>
+
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">triggers {} in the Jenkinsfile — everything declarative</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+
+    triggers {
+        pollSCM('H/5 * * * *')          // poll every 5 minutes (H = hashed/staggered)
+        cron('H 2 * * *')               // nightly at ~02:00, spread load with H
+        // githubPush()                 // requires the GitHub plugin + job trigger ticked
+        // upstream(upstreamProjects: 'library-pipeline', threshold: hudson.model.Result.SUCCESS)
+    }
+    ...
+}</code></pre></div>
+
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>The <code>triggers</code> block doesn't create the webhook</span>
+    <code>triggers { pollSCM(...) }</code> only updates the job's <em>internal</em> configuration when the Jenkinsfile runs. The GitHub-side webhook must be created once, by hand (or by the GitHub Branch Source plugin in Block 15). If pushes do nothing, check GitHub → <em>Recent Deliveries</em> first.</div>
+
+    <h3><span class="hn">10.3</span> Cron syntax, Jenkins style</h3>
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">cron</span><span class="fn">MINUTE HOUR DAY-OF-MONTH MONTH DAY-OF-WEEK</span><button class="copy">📋 Copy</button></div><pre><code>H/15 * * * *     every 15 minutes
+H 2 * * *        once a day around 02:00
+H 2 * * 1-5      weekdays around 02:00
+H(0-30) 9 * * *  between 09:00 and 09:30
+0 3 1 * *        the 1st of the month at 03:00 sharp</code></pre></div>
+    <div class="tip"><span class="lbl"><span class="ic">💡</span>Always use <code>H</code> (hash)</span>
+    <code>H</code> is a pseudo-random value derived from the job name. Ten jobs with <code>0 2 * * *</code> all fire at exactly 02:00 and stampede the controller; <code>H 2 * * *</code> spreads them across the hour. Using <code>H</code> is a small habit that marks you as someone who has run Jenkins at scale.</div>
+
+    <h3><span class="hn">10.4</span> Triggering from outside (API / remote token)</h3>
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Remote trigger with an auth token</span><button class="copy">📋 Copy</button></div><pre><code># 1. In the job: Build Triggers -> "Trigger builds remotely" -> Token: BUILD_ME
+# 2. Create an API token: Manage Jenkins -> your user -> Security -> API Token
+# 3. Fetch a CSRF crumb, then POST:
+CRUMB=$(curl -s -u user:$TOKEN "$JENKINS_URL/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,\":\",//crumb)")
+curl -X POST -u user:$TOKEN -H "$CRUMB" \
+     "$JENKINS_URL/job/nodejs-app/build?token=BUILD_ME"
+
+# ...with parameters:
+curl -X POST -u user:$TOKEN -H "$CRUMB" \
+     "$JENKINS_URL/job/nodejs-app/buildWithParameters?token=BUILD_ME&amp;ENV=qa&amp;RUN_TESTS=true"</code></pre></div>
+
+    <h3><span class="hn">10.5</span> Chaining pipelines</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Start another job from a pipeline</span><button class="copy">📋 Copy</button></div><pre><code>// fire-and-forget
+build job: 'python-app', parameters: [booleanParam(name: 'RUN_TESTS', value: true)], wait: false
+
+// wait and use the result
+def result = build job: 'deploy-pipeline',
+                   parameters: [string(name: 'IMAGE_TAG', value: env.GIT_SHA)],
+                   propagate: false, wait: true
+echo "Deploy job finished: ${result.result}"
+if (result.result != 'SUCCESS') { error "Deployment failed" }</code></pre></div>
+
+    <h3><span class="hn">10.6</span> ✍️ Jenkinsfiles v10 — triggered</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Add to BOTH apps (identical block)</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+
+    triggers {
+        // Primary: the GitHub webhook (job must have "GitHub hook trigger for GITScm polling" ticked)
+        // Fallback: poll every 10 minutes in case the webhook is down
+        pollSCM('H/10 * * * *')
+        // Nightly full run (also re-runs security scans in later blocks)
+        cron('H 3 * * *')
+    }
+
+    options {
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '5'))
+        disableConcurrentBuilds()
+    }
+    ...
+}</code></pre></div>
+
+    <h3><span class="hn">10.7</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>GitHub webhook shows a green <code>200</code> in <em>Recent Deliveries</em>.</li>
+      <li>A <code>git push</code> starts a build within ~10 seconds — no clicking.</li>
+      <li>Nightly cron is configured and I understand what <code>H</code> does.</li>
+      <li>I triggered a build from <code>curl</code> with a token and a crumb.</li>
+    </ul>
+
+    <h3><span class="hn">10.8</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>Webhook vs SCM polling — which do you choose and why?</div><div class="a">Webhooks: instant, no wasted API calls, and they also deliver PR events. The requirement is that GitHub can reach Jenkins. If the controller is behind a firewall or on a private network, polling is the pragmatic fallback — I'd poll every 5–10 minutes and accept the latency.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>A webhook is configured but nothing happens. How do you debug?</div><div class="a">Start at GitHub → Webhooks → Recent Deliveries: a <code>200</code> means GitHub delivered it, so the problem is on the Jenkins side (job trigger not ticked, wrong branch filter, multibranch scan not configured). A <code>403</code> is usually a missing CSRF crumb; a timeout means the security group blocks GitHub. Then check <span class="path">/var/log/jenkins/jenkins.log</span> and the job's <em>Git polling log</em>.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>What is the <code>H</code> in <code>H/5 * * * *</code>?</div><div class="a">A hash of the job name that Jenkins substitutes for a stable pseudo-random number. It staggers schedules so hundreds of jobs don't fire on the same minute and stampede the controller.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>How do you start pipeline B when pipeline A finishes?</div><div class="a">With the <code>build job:</code> step, passing parameters and choosing <code>wait</code>/<code>propagate</code>. Or declaratively with <code>triggers { upstream(...) }</code>. I set <code>propagate: false</code> when I want to handle the downstream result myself (for example to mark the build unstable instead of failed).</div></div>
+    </div>
+
+    <h3><span class="hn">10.9</span> 🔥 Common errors</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td>Webhook returns <code>302</code></td><td>Missing trailing slash on <span class="path">/github-webhook/</span></td><td>Add the slash</td></tr>
+        <tr><td>Webhook returns <code>403</code></td><td>CSRF protection, or anonymous has no Job/Build permission</td><td>Send the crumb header; grant the hook user minimal build rights</td></tr>
+        <tr><td>Delivery shows <code>200</code> but no build</td><td>Job trigger not enabled, or branch filter mismatch</td><td>Tick "GitHub hook trigger for GITScm polling"; check the branch specifier</td></tr>
+        <tr><td>Webhook times out</td><td>Security group / firewall blocks GitHub</td><td>Allow GitHub's IP ranges, or put Jenkins behind a reverse proxy, or fall back to polling</td></tr>
+        <tr><td>Polling log says "no changes"</td><td>Wrong branch specifier (<code>*/master</code> vs <code>*/main</code>)</td><td>Match the real default branch name</td></tr>
+      </tbody>
+    </table></div>
+
+<h3><span class="hn">10.10</span> Under the hood — what a webhook delivery actually is</h3>
+<p>GitHub sends an HTTP <code>POST</code> to <span class="path">/github-webhook/</span> with a JSON body describing the event and an <code>X-GitHub-Event</code> header (<code>push</code>, <code>pull_request</code>, …). The GitHub plugin:</p>
+<ol class="steps">
+  <li>Verifies the payload (optionally with the HMAC secret you configured — always set it).</li>
+  <li>Finds jobs whose SCM URL matches the repository.</li>
+  <li>For classic jobs, triggers a build if <em>GitHub hook trigger for GITScm polling</em> is enabled; for Multibranch, triggers a repository scan.</li>
+  <li>Returns <code>200</code>. Any other code shows up red in GitHub's <em>Recent Deliveries</em>.</li>
+</ol>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Replay a delivery by hand (great for debugging)</span><button class="copy">📋 Copy</button></div><pre><code># Take the payload from GitHub -> Webhooks -> Recent Deliveries -> Request
+curl -X POST http://&lt;jenkins&gt;:8080/github-webhook/ \
+     -H "Content-Type: application/json" \
+     -H "X-GitHub-Event: push" \
+     -H "X-Hub-Signature-256: sha256=..." \
+     --data @payload.json -i</code></pre></div>
+
+<h3><span class="hn">10.11</span> Trigger decision matrix</h3>
+<div class="tw"><table>
+<thead><tr><th>Scenario</th><th>Best trigger</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Every push should build</td><td><strong>Webhook</strong> (<code>push</code> event)</td><td>Instant, no polling cost</td></tr>
+<tr><td>Pull requests need validation</td><td><strong>Webhook</strong> + PR discovery (Multibranch)</td><td>Builds the merge result, reports status to the PR</td></tr>
+<tr><td>Jenkins behind a firewall</td><td><strong>pollSCM</strong></td><td>Outbound only — works without inbound access</td></tr>
+<tr><td>Nightly full scan</td><td><code>cron('H 3 * * *')</code></td><td>Expensive jobs off the critical path</td></tr>
+<tr><td>Shared library changed → rebuild consumers</td><td><code>upstream()</code> or <code>build job:</code></td><td>Explicit dependency</td></tr>
+<tr><td>External system (Jira, cron box, GitHub Actions)</td><td><strong>Remote token</strong> + API</td><td>Authenticated, fire-and-forget</td></tr>
+<tr><td>Release to production</td><td>Manual + <code>input</code> approval</td><td>Human in the loop</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">10.12</span> Lab — webhook forensics</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 10.1 · Diagnose a webhook that does nothing</span>
+Work top-down; stop at the first failure.
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">The decision tree</span><button class="copy">📋 Copy</button></div><pre><code># 1. Did GitHub deliver it?  (GitHub -> Webhooks -> Recent Deliveries)
+#      200/204  -> Jenkins received it: problem is inside Jenkins
+#      302      -> missing trailing slash on /github-webhook/
+#      403      -> CSRF crumb missing, or anonymous lacks Job/Build
+#      timeout  -> security group / firewall blocks GitHub
+
+# 2. Can GitHub reach you at all?
+curl -sS -o /dev/null -w "%{http_code}\n" http://&lt;jenkins&gt;:8080/github-webhook/
+# (a bare GET normally returns 405 or 302 -- that means you ARE reachable)
+
+# 3. Is the Jenkins-side trigger enabled?
+#    job -> Configure -> Build Triggers -> [x] GitHub hook trigger for GITScm polling
+
+# 4. Does the repo URL in the job match the payload's repository URL exactly?
+#    (ssh vs https, trailing .git, case) -- they must match
+
+# 5. Still nothing? Watch the log while you push:
+sudo tail -f /var/log/jenkins/jenkins.log | grep -i github</code></pre></div>
+</div>
+
+<h3><span class="hn">10.13</span> Cron reference</h3>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">cron</span><span class="fn">MINUTE HOUR DOM MONTH DOW — with H for staggering</span><button class="copy">📋 Copy</button></div><pre><code>H/5  * * * *     every 5 minutes   (H2/5 = at 2,7,12,...)
+H    2 * * *     once daily ~02:00
+H    2 * * 1-5   weekdays ~02:00
+H(0-30) 9 * * *  somewhere between 09:00 and 09:30
+0    3 1 * *     03:00 on the 1st of each month
+H    H/4 * * *   every 4 hours
+# Jenkins tip: H is a hash of the job name -> stable but staggered.</code></pre></div>
+
+<h3><span class="hn">10.14</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q5</span>How do you secure a webhook endpoint?</div><div class="a">Set the webhook secret so Jenkins can verify the HMAC signature, allow only GitHub's IP ranges at the firewall (or put a proxy in front), use HTTPS, and grant the minimal permission needed to trigger builds rather than admin rights.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q6</span>Push events fire builds, but PR events do nothing. What's missing?</div><div class="a">The webhook must subscribe to <em>Pull requests</em>, and the Multibranch job needs a PR discovery behaviour configured (e.g. "Discover pull requests from origin"). With those, Jenkins builds <code>PR-&lt;n&gt;</code> and exposes <code>CHANGE_ID</code>.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>How do you avoid a storm of builds when 10 commits are pushed quickly?</div><div class="a">Enable the quiet period (a few seconds) so Jenkins coalesces changes, and use <code>disableConcurrentBuilds(abortPrevious:true)</code> on expensive jobs. For very busy repos, a branch-level strategy that builds only the latest commit is the answer.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>How do you rebuild only what a commit affected in a multi-service repo?</div><div class="a">Compute changed paths from the changelog or use path filters in the branch source, then gate each service's stages with <code>when</code>. At scale I'd split into per-service jobs so the trigger itself is already scoped.</div></div>
+</div>
+</section>

@@ -1,0 +1,73 @@
+# ============================================================
+#  jenkins/plugins.txt -- curated plugin manifest
+#  Install headlessly:  jenkins-plugin-cli --plugin-file plugins.txt
+#  Update this file every time a block adds a plugin (Block 1 / 22).
+# ============================================================
+
+# ---- Block 1: core ----
+workflow-aggregator          # Declarative + Scripted pipeline engine
+git                          # Git SCM
+credentials                  # Credentials store
+credentials-binding          # withCredentials {} / sshagent {}
+scm-api                      # Required by branch source plugins
+blueocean                    # Modern pipeline UI (learning)
+pipeline-stage-view          # Stage view on the classic job page
+timestamper                  # Timestamps in console output
+ansicolor                    # Coloured npm/pytest output
+
+# ---- Block 3: syntax tooling (built-in endpoints, no plugin needed) ----
+
+# ---- Block 4: Git + GitHub ----
+github                       # GitHub server config + /github-webhook/ endpoint
+github-branch-source         # Multibranch + Organization folders (Block 15)
+
+# ---- Block 6: tests & coverage ----
+junit                        # Publish JUnit XML, per-test history
+coverage                     # Coverage trends (replaces the old Cobertura plugin)
+
+# ---- Block 9: Docker ----
+docker-workflow              # docker.build / withRegistry / inside
+docker-commons
+
+# ---- Block 11: post block + cleanup ----
+ws-cleanup                   # cleanWs()
+build-timeout                # Abort hung builds (Block 21)
+
+# ---- Block 12: RBAC ----
+role-strategy                # Role-Based Authorization Strategy
+matrix-auth                  # Matrix / project-based security
+
+# ---- Block 13: agents & tools ----
+nodejs                       # NodeJS tool installer
+ssh-slaves                   # Launch agents via SSH
+ssh-credentials              # SSH key credentials
+
+# ---- Block 14: shared libraries ----
+pipeline-groovy-lib          # "Pipeline: Shared Groovy Libraries"
+lockable-resources           # lock{} (Block 21)
+
+# ---- Block 16: SAST ----
+sonar                        # SonarQube Scanner for Jenkins
+
+# ---- Block 17: SCA & warnings ----
+warnings-ng                  # Trend lint/SAST issues (ESLint, flake8, Bandit)
+dependency-check-jenkins-plugin   # OWASP Dependency-Check
+
+# ---- Block 19/20: deploy & notify ----
+ssh-agent                    # sshagent{} (usually bundled with ssh-slaves)
+publish-over-ssh             # Alternative: send files / run commands over SSH
+slack                        # Slack notifications
+email-ext                    # Extended E-mail Notification
+http_request                 # Generic webhooks (Teams / Discord / PagerDuty)
+
+# ---- Block 22: operations ----
+configuration-as-code        # JCasC: controller as YAML
+thinBackup                   # Scheduled, UI-driven backups
+monitoring                   # Prometheus metrics endpoint
+jobConfigHistory             # Track config changes
+audit-trail                  # Who did what, when
+
+# ---- Optional but handy ----
+rebuild                      # Re-run a build with the same parameters
+build-name-setter            # Prettier build display names
+disk-usage                   # See which jobs eat the disk

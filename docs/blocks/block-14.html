@@ -1,0 +1,493 @@
+<section class="block" id="block-14" data-block="14" data-title="Shared Libraries">
+    <div class="bhead"><div class="bnum">14</div><div>
+      <div class="bl">Block 14 · Real engineering</div>
+      <h2>Shared Libraries — stop repeating yourself</h2>
+      <p class="bgoal"><b>Goal:</b> move duplicated pipeline logic into one versioned, testable library that both apps use. This is the single biggest signal of a senior Jenkins engineer.</p>
+    </div></div>
+
+    <h3><span class="hn">14.1</span> The problem and the fix</h3>
+    <p>By now <span class="path">nodejs-app/Jenkinsfile</span> and <span class="path">python-app/Jenkinsfile</span> are 90% identical: checkout, build, test, docker build, push, notify. If you need to change the tag strategy you must edit every file — and you will forget one. A <strong>shared library</strong> is a Git repo of Groovy code that pipelines import.</p>
+
+    <div class="code" data-lang="text"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">tree</span><span class="fn">jenkins-shared-library/  (its own Git repo)</span><button class="copy">📋 Copy</button></div><pre><code>jenkins-shared-library/
+├── vars/                       &lt;-- every file becomes a GLOBAL STEP by filename
+│   ├── buildAndPushImage.groovy      -> step: buildAndPushImage(...)
+│   ├── runTests.groovy               -> step: runTests(...)
+│   ├── notifyBuild.groovy            -> step: notifyBuild(...)
+│   └── standardPipeline.groovy       -> step: standardPipeline { ... }   (full template)
+├── src/
+│   └── com/example/ci/
+│       └── Docker.groovy       &lt;-- real Groovy classes: import com.example.ci.Docker
+└── resources/
+    └── scripts/deploy.sh       &lt;-- non-Groovy files, loaded with libraryResource</code></pre></div>
+
+    <div class="tw"><table>
+      <thead><tr><th>Directory</th><th>Becomes</th><th>Use for</th></tr></thead>
+      <tbody>
+        <tr><td><span class="path">vars/</span></td><td>A global step named after the file</td><td>90% of your library — pipeline-facing steps</td></tr>
+        <tr><td><span class="path">src/</span></td><td>Regular Groovy classes you <code>import</code></td><td>Complex logic, parsing, API clients</td></tr>
+        <tr><td><span class="path">resources/</span></td><td>Files loaded with <code>libraryResource</code></td><td>Shell scripts, JSON templates, config</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">14.2</span> Registering the library</h3>
+    <p><em>Manage Jenkins → System → Global Pipeline Libraries → Add</em>:</p>
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">ui</span><span class="fn">Global Pipeline Library configuration</span><button class="copy">📋 Copy</button></div><pre><code>Name              : jenkins-shared-library     &lt;-- the name pipelines reference
+Default version   : main                        &lt;-- branch/tag (@main, @v1.2.0)
+Load implicitly   : ☐  (leave OFF: pipelines opt in explicitly)
+Allow default version to be overridden : ☑
+Include @Library changes in job recent changes : ☑
+
+Retrieval method  : Modern SCM
+  Source Code Management : Git
+    Project Repository   : git@github.com:&lt;you&gt;/jenkins-shared-library.git
+    Credentials          : github-ssh</code></pre></div>
+
+    <h3><span class="hn">14.3</span> Writing your first steps</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">vars/notifyBuild.groovy — one file = one step</span><button class="copy">📋 Copy</button></div><pre><code>// vars/notifyBuild.groovy
+// Called from a pipeline as:  notifyBuild('SUCCESS')
+def call(String buildStatus = 'STARTED') {
+    def color  = buildStatus == 'SUCCESS'  ? 'good'    :
+                 buildStatus == 'UNSTABLE' ? 'warning' :
+                 buildStatus == 'FAILURE'  ? 'danger'  : 'good'
+
+    def subject = "${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+    def summary = "${subject}\nCommit: ${env.GIT_COMMIT ?: 'n/a'}\nMore: ${env.BUILD_URL}"
+
+    echo summary                          // always visible in the console
+
+    // Send to Slack only if the plugin + credential exist (safe on any controller)
+    try {
+        withCredentials([string(credentialsId: 'slack-token', variable: 'SLACK_TOKEN')]) {
+            slackSend channel: '#ci', color: color, message: summary, tokenCredentialId: 'slack-bot'
+        }
+    } catch (err) {
+        echo "Slack notification skipped: ${err.message}"
+    }
+}</code></pre></div>
+
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">vars/buildAndPushImage.groovy</span><button class="copy">📋 Copy</button></div><pre><code>// vars/buildAndPushImage.groovy
+// Usage:  buildAndPushImage(image: 'user/app', tag: env.GIT_SHA, context: 'nodejs-app')
+def call(Map config = [:]) {
+    def image   = config.image   ?: error('buildAndPushImage: `image` is required')
+    def tag     = config.tag     ?: env.GIT_SHA ?: env.BUILD_NUMBER
+    def context = config.context ?: '.'
+    def pushLatest = config.get('pushLatest', false)
+    def extraTags  = config.get('extraTags', [])
+
+    dir(context) {
+        def img = docker.build("${image}:${tag}", '--pull .')
+
+        docker.withRegistry('https://index.docker.io/v1/', 'dockerhub-creds') {
+            img.push(tag)
+            extraTags.each { t -&gt; img.push(t) }
+            if (pushLatest) { img.push('latest') }
+        }
+
+        def digest = sh(script: "docker inspect --format='{{index .RepoDigests 0}}' ${image}:${tag}",
+                        returnStdout: true).trim()
+        echo "Pushed ${digest}"
+        return "${image}:${tag}"
+    }
+}</code></pre></div>
+
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">vars/runTests.groovy — one step for both ecosystems</span><button class="copy">📋 Copy</button></div><pre><code>// vars/runTests.groovy
+// Usage:  runTests(type: 'node', minCoverage: 70)
+//         runTests(type: 'python', minCoverage: 80)
+def call(Map config = [:]) {
+    def type = config.type ?: error('runTests: `type` must be "node" or "python"')
+    def min  = config.get('minCoverage', 70)
+
+    try {
+        if (type == 'node') {
+            sh label: 'jest', script: 'npm run test:junit'
+        } else if (type == 'python') {
+            sh label: 'pytest', script: ". venv/bin/activate &amp;&amp; pytest --cov-fail-under=${min}"
+        } else {
+            error "Unknown project type: ${type}"
+        }
+    } finally {
+        // always publish, even if the tests failed -- that's the whole point
+        junit testResults: 'reports/junit.xml', allowEmptyResults: true
+    }
+}</code></pre></div>
+
+    <h3><span class="hn">14.4</span> The big one: a full pipeline template</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">vars/standardPipeline.groovy — a declarative wrapper</span><button class="copy">📋 Copy</button></div><pre><code>// vars/standardPipeline.groovy
+// A "template method": the library owns the shape, each app fills in the details.
+//
+// Usage from a Jenkinsfile:
+//   standardPipeline {
+//       type      = 'node'            // or 'python'
+//       image     = 'user/nodejs-app'
+//       context   = 'nodejs-app'
+//       minCoverage = 70
+//   }
+def call(Map config, Closure body = null) {
+    def type    = config.type ?: 'node'
+    def image   = config.image ?: error('standardPipeline: `image` required')
+    def context = config.context ?: '.'
+    def min     = config.get('minCoverage', 70)
+    def agent   = type == 'node' ? 'node:20-alpine' : 'python:3.12-slim'
+
+    pipeline {
+        agent none
+
+        options {
+            timestamps()
+            timeout(time: 40, unit: 'MINUTES')
+            buildDiscarder(logRotator(numToKeepStr: '50', artifactNumToKeepStr: '10'))
+            disableConcurrentBuilds()
+        }
+
+        stages {
+            stage('Checkout') {
+                agent { label 'linux' }
+                steps {
+                    script {
+                        checkout scm
+                        env.GIT_SHA = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                        currentBuild.description = env.GIT_SHA
+                    }
+                }
+            }
+
+            stage('Build') {
+                agent { docker { image "${agent}"; reuseNode true } }
+                steps {
+                    dir(context) {
+                        sh type == 'node' ? 'npm ci'
+                                          : 'python -m venv venv &amp;&amp; . venv/bin/activate &amp;&amp; pip install -r requirements-dev.txt'
+                    }
+                }
+            }
+
+            stage('Test') {
+                agent { docker { image "${agent}"; reuseNode true } }
+                steps {
+                    dir(context) { runTests(type: type, minCoverage: min) }
+                }
+            }
+
+            stage('Package &amp; Push') {
+                agent { label 'docker' }
+                when { anyOf { branch 'main'; branch 'develop' } }
+                steps {
+                    buildAndPushImage(image: image, tag: env.GIT_SHA, context: context,
+                                      pushLatest: (env.BRANCH_NAME == 'main'),
+                                      extraTags: [env.BUILD_NUMBER])
+                }
+            }
+        }
+
+        post {
+            always  { script { notifyBuild(currentBuild.currentResult) } }
+            cleanup { node('linux') { cleanWs() } }
+        }
+    }
+}</code></pre></div>
+
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">The Jenkinsfiles become tiny</span><button class="copy">📋 Copy</button></div><pre><code>// nodejs-app/Jenkinsfile
+@Library('jenkins-shared-library@main') _
+standardPipeline {
+    type        = 'node'
+    image       = '&lt;user&gt;/nodejs-app'
+    context     = 'nodejs-app'
+    minCoverage = 70
+}
+
+// python-app/Jenkinsfile
+@Library('jenkins-shared-library@main') _
+standardPipeline {
+    type        = 'python'
+    image       = '&lt;user&gt;/python-app'
+    context     = 'python-app'
+    minCoverage = 70
+}</code></pre></div>
+
+    <div class="info"><span class="lbl"><span class="ic">🧠</span>Why the trailing underscore?</span>
+    <code>@Library('name') _</code> is the correct syntax when you are <em>not</em> importing a class — the bare <code>_</code> is a placeholder for "no import statement". Without it Groovy parses the annotation incorrectly. Also note: <code>@Library</code> must be on its own line above everything else (only comments may precede it).</div>
+
+    <h3><span class="hn">14.5</span> Versioning &amp; safety</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Practice</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Pin the version: <code>@Library('lib@v1.4.0') _</code></td><td>Branches move. A tag gives reproducible builds; use <code>@main</code> only in development.</td></tr>
+        <tr><td>Test library changes on a branch first</td><td>Point one test pipeline at <code>@feature-branch</code> before merging to main.</td></tr>
+        <tr><td>Unit-test with <strong>JenkinsPipelineUnit</strong></td><td>A JUnit-based framework that runs your vars against a mocked Jenkins. Real teams do this.</td></tr>
+        <tr><td>Keep <span class="path">vars/</span> thin</td><td>Business logic belongs in <span class="path">src/</span> classes, which are far easier to unit test.</td></tr>
+        <tr><td>Remember the trust boundary</td><td>Library code runs <strong>outside the Groovy sandbox</strong> — it can do anything on the controller. Review library PRs like production code, and restrict who can push to the library repo.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">14.6</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>Created the shared-library repo with <span class="path">vars/</span> and registered it in Jenkins.</li>
+      <li>Both Jenkinsfiles shrank to ~8 lines and still build, test and push.</li>
+      <li>Pinned a tag (<code>@v1.0.0</code>) and confirmed the pipeline uses it.</li>
+      <li>I can explain what <code>@Library('x') _</code> does and why the underscore is there.</li>
+    </ul>
+
+    <h3><span class="hn">14.7</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>What is a Jenkins shared library and why use one?</div><div class="a">A Git repository of Groovy code that pipelines import with <code>@Library('name@version') _</code>. Files in <span class="path">vars/</span> become global steps, <span class="path">src/</span> holds classes, and <span class="path">resources/</span> holds non-Groovy files. It removes duplication across dozens of Jenkinsfiles, so a change to tagging, notifications or scanning is made once, reviewed once, and adopted everywhere.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>How do you version shared libraries safely?</div><div class="a">Tag releases and reference a tag (<code>@v1.4.0</code>) from production pipelines, so a change to <code>main</code> can't break them. New versions are validated by pointing a test pipeline at the branch first, and by unit tests with JenkinsPipelineUnit.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>What are the security implications?</div><div class="a">Shared library code runs outside the Groovy sandbox with full controller privileges, so anyone who can merge to the library repo effectively has admin on Jenkins. I'd restrict write access, require code review, and keep secrets handling in the credentials store rather than in library code.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>How do you test a shared library?</div><div class="a">With JenkinsPipelineUnit — a JUnit framework that mocks the Jenkins runtime so I can assert that steps were called with the right arguments. I keep logic in <span class="path">src/</span> classes where possible, because plain Groovy classes are much easier to unit test than pipeline scripts.</div></div>
+    </div>
+
+<h3><span class="hn">14.8</span> Under the hood — how a library is loaded</h3>
+<ol class="steps">
+  <li><strong>Resolution.</strong> The library name (<code>jenkins-shared-library</code>) is looked up in Global Pipeline Libraries → the SCM is checked out to <span class="path">$JENKINS_HOME/workflow-libs/&lt;name&gt;/</span> at the requested version.</li>
+  <li><strong>Loading.</strong> Files in <span class="path">vars/</span> are compiled into <em>global CPS-transformed scripts</em>: <span class="path">vars/foo.groovy</span> with a <code>call()</code> method becomes the step <code>foo(...)</code>. Classes in <span class="path">src/</span> are loaded by the Groovy classloader and available via <code>import</code>.</li>
+  <li><strong>Sandbox.</strong> Library code runs <strong>outside</strong> the Groovy sandbox — it has full controller privileges. That's the security trade-off for its power.</li>
+  <li><strong>Caching.</strong> The checkout is cached per version; changing <code>@main</code> means new commits are pulled on the next run.</li>
+</ol>
+<div class="dang"><span class="lbl"><span class="ic">🚨</span>Three consequences you must internalise</span>
+<ul style="margin:0;padding-left:20px">
+<li>Library code can do anything — restrict who can merge to it.</li>
+<li><code>@main</code> means a bad merge breaks every consumer at once. Pin tags in production.</li>
+<li>Steps defined in <span class="path">vars/</span> run in CPS: keep them thin and put heavy logic in <span class="path">src/</span>.</li>
+</ul></div>
+
+<h3><span class="hn">14.9</span> Writing a library step properly</h3>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">vars/deployCompose.groovy — docs, defaults, validation, return value</span><button class="copy">📋 Copy</button></div><pre><code>// vars/deployCompose.groovy
+//
+// Deploy a compose stack over SSH.
+//
+//   deployCompose(host: 'staging.example.com',
+//                 stackPath: '/opt/nodejs-app',
+//                 image: 'user/nodejs-app',
+//                 tag: env.GIT_SHA,
+//                 port: 3000,
+//                 healthPath: '/health')
+//
+def call(Map config) {
+    // ---- 1. validate inputs loudly -------------------------------------
+    ['host', 'stackPath', 'image', 'tag'].each { k -&gt;
+        if (!config[k]) { error "deployCompose: '${k}' is required" }
+    }
+    def port       = config.get('port', 3000)
+    def healthPath = config.get('healthPath', '/health')
+    def credId     = config.get('credentialsId', 'deploy-key')
+    def user       = config.get('user', 'ubuntu')
+
+    // ---- 2. do the work -------------------------------------------------
+    sshagent(credentials: [credId]) {
+        sh """
+            ssh -o StrictHostKeyChecking=no ${user}@${config.host} '
+                set -e
+                cd ${config.stackPath}
+                export IMAGE_REPO=${config.image} IMAGE_TAG=${config.tag}
+                docker compose pull
+                docker compose up -d --remove-orphans
+                curl -fsS --retry 20 --retry-delay 3 http://localhost:${port}${healthPath}
+            '
+        """
+    }
+
+    // ---- 3. return something useful ------------------------------------
+    return "${config.image}:${config.tag}@${config.host}"
+}</code></pre></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">src/com/example/ci/DeployTarget.groovy — pure logic, easy to test</span><button class="copy">📋 Copy</button></div><pre><code>package com.example.ci
+
+/** Value object describing where an app can be deployed. */
+class DeployTarget implements Serializable {
+    String host
+    String path
+    String user = 'ubuntu'
+    int    port
+    String healthPath = '/health'
+
+    String composeCommand(String repo, String tag) {
+        "cd ${path} &amp;&amp; IMAGE_REPO=${repo} IMAGE_TAG=${tag} docker compose up -d --remove-orphans"
+    }
+
+    String healthUrl() { "http://localhost:${port}${healthPath}" }
+
+    static DeployTarget nodejs(String envName) {
+        envName == 'prod'
+            ? new DeployTarget(host: 'prod.example.com',   path: '/opt/nodejs-app', port: 3000)
+            : new DeployTarget(host: 'staging.example.com', path: '/opt/nodejs-app', port: 3000)
+    }
+}</code></pre></div>
+
+<h3><span class="hn">14.10</span> Unit testing the library (JenkinsPipelineUnit)</h3>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">build.gradle</span><button class="copy">📋 Copy</button></div><pre><code>plugins { id 'groovy' }
+repositories { mavenCentral() }
+dependencies {
+    testImplementation 'org.jenkins-ci.main:jenkins-core:2.452'
+    testImplementation 'com.lesfurets:jenkins-pipeline-unit:1.14'
+    testImplementation 'org.spockframework:spock-core:2.3-groovy-3.0'
+}</code></pre></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">test/com/example/RunTestsSpec.groovy</span><button class="copy">📋 Copy</button></div><pre><code>package com.example
+
+import com.lesfurets.jenkins.unit.BasePipelineTest
+import org.junit.Before
+import org.junit.Test
+
+class RunTestsSpec extends BasePipelineTest {
+
+    @Override @Before
+    void setUp() {
+        super.setUp()
+        binding.setVariable('env', [BRANCH_NAME: 'main', BUILD_NUMBER: '7'])
+    }
+
+    @Test void 'runs npm test for node projects'() {
+        def script = loadScript('vars/runTests.groovy')
+        script.call(type: 'node', minCoverage: 70)
+        assert helper.callStack.findAll { it.methodName == 'sh' }
+                .any { it.toString().contains('npm run test:junit') }
+        printCallStack()
+    }
+
+    @Test void 'rejects an unknown project type'() {
+        def script = loadScript('vars/runTests.groovy')
+        try {
+            script.call(type: 'ruby')
+            assert false : 'should have thrown'
+        } catch (Exception e) {
+            assert e.message.contains('Unknown project type')
+        }
+    }
+}</code></pre></div>
+<div class="tip"><span class="lbl"><span class="ic">💡</span>Worth ten minutes of your time</span>
+Being able to say "our shared library has unit tests that run in CI" is a genuine differentiator. Very few Jenkins engineers do it, and interviewers notice immediately.</div>
+
+<h3><span class="hn">14.11</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q5</span>How do you structure a shared library for a large organisation?</div><div class="a"><span class="path">vars/</span> for the thin, stable, documented step API; <span class="path">src/</span> for the real logic as testable classes; <span class="path">resources/</span> for scripts and templates. Semantic-versioned releases pinned by consumers, unit tests with JenkinsPipelineUnit, and a CHANGELOG. Breaking changes go in a new major version — never silently on <code>main</code>.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q6</span>How do you roll out a breaking library change?</div><div class="a">Add the new version alongside the old (a new step name or a new major tag), migrate a pilot team first, keep both working for one release cycle, then update everyone and remove the old path. Because consumers pin versions, the migration is a coordinated set of pull requests rather than an outage.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>Can a shared library call another shared library?</div><div class="a">Yes — a library can depend on another via its own <code>@Library</code> annotation or through configured library dependencies. I keep the dependency graph shallow (one or two levels) because deep chains are hard to reason about and to version.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>Why does my library step not see <code>env</code> or <code>sh</code>?</div><div class="a">Steps in <span class="path">vars/</span> run as CPS scripts that delegate to the surrounding pipeline, so they must be called from inside a pipeline context. Pure classes in <span class="path">src/</span> have no pipeline context at all — pass what they need as arguments, which is also exactly what makes them testable.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>How do you document a shared library?</div><div class="a">A <span class="path">README.md</span> in the library repo plus a Javadoc-style comment block at the top of every <span class="path">vars/</span> file showing usage and parameters. Jenkins also renders a sibling <span class="path">vars/&lt;step&gt;.txt</span> as inline help in the Snippet Generator, so I add one for each step.</div></div>
+</div>
+
+<h3><span class="hn">14.8</span> Under the hood — how a library is loaded</h3>
+<ol class="steps">
+  <li><strong>Resolution.</strong> The library name (<code>jenkins-shared-library</code>) is looked up in Global Pipeline Libraries → the SCM is checked out to <span class="path">$JENKINS_HOME/workflow-libs/&lt;name&gt;/</span> at the requested version.</li>
+  <li><strong>Loading.</strong> Files in <span class="path">vars/</span> are compiled into <em>global CPS-transformed scripts</em>: <span class="path">vars/foo.groovy</span> with a <code>call()</code> method becomes the step <code>foo(...)</code>. Classes in <span class="path">src/</span> are loaded by the Groovy classloader and available via <code>import</code>.</li>
+  <li><strong>Sandbox.</strong> Library code runs <strong>outside</strong> the Groovy sandbox — it has full controller privileges. That's the security trade-off for its power.</li>
+  <li><strong>Caching.</strong> The checkout is cached per version; changing <code>@main</code> means new commits are pulled on the next run.</li>
+</ol>
+<div class="dang"><span class="lbl"><span class="ic">🚨</span>Three consequences you must internalise</span>
+<ul style="margin:0;padding-left:20px">
+<li>Library code can do anything — restrict who can merge to it.</li>
+<li><code>@main</code> means a bad merge breaks every consumer at once. Pin tags in production.</li>
+<li>Steps defined in <span class="path">vars/</span> run in CPS: keep them thin and put heavy logic in <span class="path">src/</span>.</li>
+</ul></div>
+
+<h3><span class="hn">14.9</span> Writing a library step properly</h3>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">vars/deployCompose.groovy — docs, defaults, validation, return value</span><button class="copy">📋 Copy</button></div><pre><code>// vars/deployCompose.groovy
+//
+// Deploy a compose stack over SSH.
+//
+//   deployCompose(host: 'staging.example.com',
+//                 stackPath: '/opt/nodejs-app',
+//                 image: 'user/nodejs-app',
+//                 tag: env.GIT_SHA,
+//                 port: 3000,
+//                 healthPath: '/health')
+//
+def call(Map config) {
+    // ---- 1. validate inputs loudly -------------------------------------
+    ['host', 'stackPath', 'image', 'tag'].each { k -&gt;
+        if (!config[k]) { error "deployCompose: '${k}' is required" }
+    }
+    def port       = config.get('port', 3000)
+    def healthPath = config.get('healthPath', '/health')
+    def credId     = config.get('credentialsId', 'deploy-key')
+    def user       = config.get('user', 'ubuntu')
+
+    // ---- 2. do the work -------------------------------------------------
+    sshagent(credentials: [credId]) {
+        sh """
+            ssh -o StrictHostKeyChecking=no ${user}@${config.host} '
+                set -e
+                cd ${config.stackPath}
+                export IMAGE_REPO=${config.image} IMAGE_TAG=${config.tag}
+                docker compose pull
+                docker compose up -d --remove-orphans
+                curl -fsS --retry 20 --retry-delay 3 http://localhost:${port}${healthPath}
+            '
+        """
+    }
+
+    // ---- 3. return something useful ------------------------------------
+    return "${config.image}:${config.tag}@${config.host}"
+}</code></pre></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">src/com/example/ci/DeployTarget.groovy — pure logic, easy to test</span><button class="copy">📋 Copy</button></div><pre><code>package com.example.ci
+
+/** Value object describing where an app can be deployed. */
+class DeployTarget implements Serializable {
+    String host
+    String path
+    String user = 'ubuntu'
+    int    port
+    String healthPath = '/health'
+
+    String composeCommand(String repo, String tag) {
+        "cd ${path} &amp;&amp; IMAGE_REPO=${repo} IMAGE_TAG=${tag} docker compose up -d --remove-orphans"
+    }
+
+    String healthUrl() { "http://localhost:${port}${healthPath}" }
+
+    static DeployTarget nodejs(String envName) {
+        envName == 'prod'
+            ? new DeployTarget(host: 'prod.example.com',   path: '/opt/nodejs-app', port: 3000)
+            : new DeployTarget(host: 'staging.example.com', path: '/opt/nodejs-app', port: 3000)
+    }
+}</code></pre></div>
+
+<h3><span class="hn">14.10</span> Unit testing the library (JenkinsPipelineUnit)</h3>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">build.gradle</span><button class="copy">📋 Copy</button></div><pre><code>plugins { id 'groovy' }
+repositories { mavenCentral() }
+dependencies {
+    testImplementation 'org.jenkins-ci.main:jenkins-core:2.452'
+    testImplementation 'com.lesfurets:jenkins-pipeline-unit:1.14'
+    testImplementation 'org.spockframework:spock-core:2.3-groovy-3.0'
+}</code></pre></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">test/com/example/RunTestsSpec.groovy</span><button class="copy">📋 Copy</button></div><pre><code>package com.example
+
+import com.lesfurets.jenkins.unit.BasePipelineTest
+import org.junit.Before
+import org.junit.Test
+
+class RunTestsSpec extends BasePipelineTest {
+
+    @Override @Before
+    void setUp() {
+        super.setUp()
+        binding.setVariable('env', [BRANCH_NAME: 'main', BUILD_NUMBER: '7'])
+    }
+
+    @Test void 'runs npm test for node projects'() {
+        def script = loadScript('vars/runTests.groovy')
+        script.call(type: 'node', minCoverage: 70)
+        assert helper.callStack.findAll { it.methodName == 'sh' }
+                .any { it.toString().contains('npm run test:junit') }
+        printCallStack()
+    }
+
+    @Test void 'rejects an unknown project type'() {
+        def script = loadScript('vars/runTests.groovy')
+        try {
+            script.call(type: 'ruby')
+            assert false : 'should have thrown'
+        } catch (Exception e) {
+            assert e.message.contains('Unknown project type')
+        }
+    }
+}</code></pre></div>
+<div class="tip"><span class="lbl"><span class="ic">💡</span>Worth ten minutes of your time</span>
+Being able to say "our shared library has unit tests that run in CI" is a genuine differentiator. Very few Jenkins engineers do it, and interviewers notice immediately.</div>
+
+<h3><span class="hn">14.11</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q5</span>How do you structure a shared library for a large organisation?</div><div class="a"><span class="path">vars/</span> for the thin, stable, documented step API; <span class="path">src/</span> for the real logic as testable classes; <span class="path">resources/</span> for scripts and templates. Semantic-versioned releases pinned by consumers, unit tests with JenkinsPipelineUnit, and a CHANGELOG. Breaking changes go in a new major version — never silently on <code>main</code>.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q6</span>How do you roll out a breaking library change?</div><div class="a">Add the new version alongside the old (a new step name or a new major tag), migrate a pilot team first, keep both working for one release cycle, then update everyone and remove the old path. Because consumers pin versions, the migration is a coordinated set of pull requests rather than an outage.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>Can a shared library call another shared library?</div><div class="a">Yes — a library can depend on another via its own <code>@Library</code> annotation or through configured library dependencies. I keep the dependency graph shallow (one or two levels) because deep chains are hard to reason about and to version.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>Why does my library step not see <code>env</code> or <code>sh</code>?</div><div class="a">Steps in <span class="path">vars/</span> run as CPS scripts that delegate to the surrounding pipeline, so they must be called from inside a pipeline context. Pure classes in <span class="path">src/</span> have no pipeline context at all — pass what they need as arguments, which is also exactly what makes them testable.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>How do you document a shared library?</div><div class="a">A <span class="path">README.md</span> in the library repo plus a Javadoc-style comment block at the top of every <span class="path">vars/</span> file showing usage and parameters. Jenkins also renders a sibling <span class="path">vars/&lt;step&gt;.txt</span> as inline help in the Snippet Generator, so I add one for each step.</div></div>
+</div>
+</section>

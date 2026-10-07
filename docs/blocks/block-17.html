@@ -1,0 +1,355 @@
+<section class="block" id="block-17" data-block="17" data-title="DevSecOps · SCA &amp; secrets">
+    <div class="bhead"><div class="bnum">17</div><div>
+      <div class="bl">Block 17 · DevSecOps &amp; scale</div>
+      <h2>DevSecOps part 2 — SCA, linting &amp; secret scanning</h2>
+      <p class="bgoal"><b>Goal:</b> catch vulnerable dependencies, insecure code patterns and leaked secrets <em>before</em> they are merged — the highest-value, lowest-effort security stage you can add.</p>
+    </div></div>
+
+    <h3><span class="hn">17.1</span> Why dependencies are the real risk</h3>
+    <p>Your code is a few thousand lines; your dependencies are a few hundred thousand. Most real-world breaches come from a vulnerable library you didn't write. SCA (Software Composition Analysis) compares your dependency tree against CVE databases.</p>
+
+    <h3><span class="hn">17.2</span> The toolchain per ecosystem</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Purpose</th><th>🟩 Node.js</th><th>🐍 Python</th><th>🐳 Both</th></tr></thead>
+      <tbody>
+        <tr><td>Dependency CVEs</td><td><code>npm audit</code>, <code>audit-ci</code></td><td><code>pip-audit</code>, <code>safety</code></td><td>Trivy <code>fs</code>, OWASP Dependency-Check</td></tr>
+        <tr><td>Static security lint</td><td><code>eslint-plugin-security</code></td><td><code>bandit</code></td><td>Semgrep</td></tr>
+        <tr><td>Style / bug lint</td><td><code>eslint</code></td><td><code>flake8</code>, <code>pylint</code></td><td>—</td></tr>
+        <tr><td>Secret scanning</td><td colspan="3"><code>gitleaks</code>, Trivy <code>fs --scanners secret</code>, <code>detect-secrets</code></td></tr>
+        <tr><td>Licence compliance</td><td><code>license-checker</code></td><td><code>pip-licenses</code></td><td>Syft + Grype</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">17.3</span> Installing the tools on the agent</h3>
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">One-time install on the Jenkins agent (or bake into the agent image)</span><button class="copy">📋 Copy</button></div><pre><code># Trivy (Aqua Security) - filesystem, container, IaC and secret scanning
+sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" \
+  | sudo tee /etc/apt/sources.list.d/trivy.list
+sudo apt-get update &amp;&amp; sudo apt-get install -y trivy
+
+# Gitleaks - secret scanning
+GITLEAKS_VERSION=$(curl -s https://api.github.com/repos/gitleaks/gitleaks/releases/latest | jq -r .tag_name)
+curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION#v}_linux_x64.tar.gz" \
+  | sudo tar -xz -C /usr/local/bin gitleaks
+
+# Python: tools come from requirements-dev.txt (pip-audit, bandit, flake8)
+# Node:   npm audit is built in; add audit-ci with `npm i -g audit-ci`
+
+trivy --version &amp;&amp; gitleaks version</code></pre></div>
+
+    <h3><span class="hn">17.4</span> Pipeline stages for SCA (both apps)</h3>
+    <div class="tabs">
+      <div class="tabbar">
+        <button class="tab on" data-t="n17">🟩 nodejs-app</button>
+        <button class="tab" data-t="p17">🐍 python-app</button>
+        <button class="tab" data-t="b17">🐳 shared (both)</button>
+      </div>
+      <div class="tabpane on" data-t="n17">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Dependency + lint scanning for Node</span><button class="copy">📋 Copy</button></div><pre><code>stage('SCA · npm audit') {
+    agent { docker { image 'node:20-alpine'; reuseNode true } }
+    steps {
+        dir('nodejs-app') {
+            // JSON report for the record, then a blocking gate on high/critical
+            sh '''
+                npm audit --audit-level=high --json > npm-audit.json || true
+                npm audit --audit-level=high            # non-zero exit => build fails
+            '''
+            archiveArtifacts artifacts: 'npm-audit.json', allowEmptyArchive: true
+        }
+    }
+}
+
+stage('Lint · ESLint') {
+    agent { docker { image 'node:20-alpine'; reuseNode true } }
+    steps {
+        dir('nodejs-app') {
+            // warnings-only: lint should not block a hotfix
+            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                sh 'npm run lint'
+            }
+        }
+    }
+}</code></pre></div>
+      </div>
+      <div class="tabpane" data-t="p17">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Dependency + security + style scanning for Python</span><button class="copy">📋 Copy</button></div><pre><code>stage('SCA · pip-audit') {
+    agent { docker { image 'python:3.12-slim'; reuseNode true } }
+    steps {
+        dir('python-app') {
+            sh '''
+                . venv/bin/activate
+                pip-audit -r requirements.txt --format json --output pip-audit.json || true
+                pip-audit -r requirements.txt                 # blocking gate
+            '''
+            archiveArtifacts artifacts: 'pip-audit.json', allowEmptyArchive: true
+        }
+    }
+}
+
+stage('SAST · Bandit') {
+    agent { docker { image 'python:3.12-slim'; reuseNode true } }
+    steps {
+        dir('python-app') {
+            sh '''
+                . venv/bin/activate
+                bandit -r app.py -f json -o bandit-report.json || true
+                bandit -r app.py -ll            # -ll = fail on MEDIUM and above
+            '''
+            archiveArtifacts artifacts: 'bandit-report.json', allowEmptyArchive: true
+        }
+    }
+}
+
+stage('Lint · flake8') {
+    agent { docker { image 'python:3.12-slim'; reuseNode true } }
+    steps {
+        dir('python-app') {
+            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                sh '. venv/bin/activate &amp;&amp; flake8 app.py tests/'
+            }
+        }
+    }
+}</code></pre></div>
+      </div>
+      <div class="tabpane" data-t="b17">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Trivy filesystem + secret scan, and gitleaks</span><button class="copy">📋 Copy</button></div><pre><code>stage('SCA · Trivy filesystem') {
+    agent { label 'linux' }
+    steps {
+        sh '''
+            trivy fs --scanners vuln,secret \
+                     --severity HIGH,CRITICAL \
+                     --exit-code 1 \
+                     --format table \
+                     --output trivy-fs.txt . || true
+
+            trivy fs --scanners vuln,secret \
+                     --severity HIGH,CRITICAL \
+                     --exit-code 1 \
+                     --ignore-unfixed \
+                     .                          # blocking gate
+        '''
+        archiveArtifacts artifacts: 'trivy-fs.txt', allowEmptyArchive: true
+    }
+}
+
+stage('Secrets · gitleaks') {
+    agent { label 'linux' }
+    steps {
+        sh '''
+            # scan the whole history available in this clone
+            gitleaks detect --source . --report-path gitleaks-report.json --redact || found=1
+            if [ -n "${found:-}" ]; then
+              echo "::SECRET DETECTED:: rotate it, then purge it from history"
+              exit 1
+            fi
+        '''
+    }
+    post {
+        always { archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true }
+    }
+}</code></pre></div>
+      </div>
+    </div>
+
+    <h3><span class="hn">17.5</span> OWASP Dependency-Check (the enterprise option)</h3>
+    <p>Common in regulated companies. Install the <strong>OWASP Dependency-Check</strong> plugin, configure the tool in <em>Manage Jenkins → Tools</em>, then:</p>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Dependency-Check step + publisher</span><button class="copy">📋 Copy</button></div><pre><code>stage('OWASP Dependency-Check') {
+    agent { label 'linux' }
+    steps {
+        dependencyCheck additionalArguments: '''
+            --scan .
+            --format HTML --format XML
+            --out .
+            --suppression suppression.xml
+            --nvdApiKey $NVD_API_KEY
+        ''', odcInstallation: 'dependency-check'
+
+        dependencyCheckPublisher pattern: 'dependency-check-report.xml'
+    }
+}</code></pre></div>
+    <div class="tip"><span class="lbl"><span class="ic">💡</span>Two practical notes</span>
+    Dependency-Check downloads the whole NVD database on first run (slow — run it nightly, not per-commit). Get a free <strong>NVD API key</strong> or downloads get throttled. Keep a <span class="path">suppression.xml</span> for accepted risks, and always record <em>why</em> a finding is suppressed with an expiry date.</div>
+
+    <h3><span class="hn">17.6</span> Publishing everything with Warnings NG</h3>
+    <p>Install <strong>Warnings NG</strong> (<code>warnings-ng</code>) to trend issues across builds instead of dumping them into logs:</p>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">recordIssues — trend graphs for every scanner</span><button class="copy">📋 Copy</button></div><pre><code>post {
+    always {
+        recordIssues(
+            enabledForFailure: true,
+            tools: [
+                eslint(pattern: 'nodejs-app/eslint-report.json'),
+                flake8(pattern: 'python-app/flake8-report.txt'),
+                pyLint(pattern: 'python-app/pylint-report.txt')
+            ],
+            qualityGates: [[threshold: 10, type: 'TOTAL', unstable: true]]
+        )
+    }
+}</code></pre></div>
+
+    <h3><span class="hn">17.7</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>Trivy and gitleaks installed on the agent.</li>
+      <li><code>npm audit</code> / <code>pip-audit</code> stage runs and fails on HIGH/CRITICAL.</li>
+      <li>Bandit runs on the Python app; you can explain the B104 finding in <span class="path">app.py</span>.</li>
+      <li>A secret I planted in a test file was caught by gitleaks.</li>
+      <li>Scan reports are archived and (ideally) trended with Warnings NG.</li>
+    </ul>
+
+    <h3><span class="hn">17.8</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>How do you scan dependencies in CI?</div><div class="a">With SCA tools in a dedicated stage: <code>npm audit --audit-level=high</code> for Node, <code>pip-audit</code> for Python, plus Trivy in filesystem mode across the repo. They exit non-zero on high/critical CVEs, which fails the build. I archive the JSON report for the record and use a suppression file with justifications for accepted risks.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>How do you prevent secrets being committed?</div><div class="a">Two layers: a pre-commit hook (gitleaks or detect-secrets) so it never leaves the developer's machine, and the same scan in CI as a blocking gate. If a secret is found I treat it as compromised — rotate first, then purge from history — because removing the commit does not un-leak it.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>Found a critical CVE in a transitive dependency with no fixed version. Now what?</div><div class="a">Assess real exposure: is the vulnerable code path reachable from our usage? If yes, mitigate (upgrade the parent, patch, or remove the dependency); if no, record a documented, time-boxed suppression so the build stays green without hiding the risk. I'd also add an alert so we revisit it when a fix lands.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>What does Bandit check, and what's a finding you've seen?</div><div class="a">Bandit is a Python AST-based SAST tool: hardcoded passwords, <code>eval</code>, weak crypto, shell injection, and binding to <code>0.0.0.0</code> (B104). In this repo it flags B104 in <span class="path">app.py</span> where the dev server binds all interfaces — acceptable for a dev entrypoint because production runs gunicorn behind a proxy, so I'd suppress it with a comment explaining why.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q5</span>Reporting vs blocking — how do you choose?</div><div class="a">Blocking gates for exploitable, high-confidence, fixable issues (critical CVEs, secrets, quality gate on new code). Reporting-only for advisory signals (style lint, low severity, informational) — those trend on a dashboard and can be promoted to gates later.</div></div>
+    </div>
+
+<h3><span class="hn">17.9</span> Under the hood — how SCA finds vulnerabilities</h3>
+<p>SCA tools build a dependency graph — your direct dependencies plus every transitive one — map each package to a <strong>PURL</strong> (package URL) or <strong>CPE</strong> identifier, and look it up in vulnerability databases (GitHub Advisory DB, OSV, NVD, npm and PyPI advisories). Three practical consequences follow:</p>
+<ul>
+<li><strong>Transitive dependencies matter most.</strong> You rarely chose the vulnerable package; a dependency of a dependency did. That is why "we only use three libraries" is not a security argument.</li>
+<li><strong>Accuracy depends on identification.</strong> Wrong identifiers produce false positives — which is what suppression files are for, always with a written reason and an expiry date.</li>
+<li><strong>Not every CVE is exploitable.</strong> A vulnerable function you never call is lower priority than one on a request path. Triage by reachability, not by severity alone.</li>
+</ul>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">See the graph yourself</span><button class="copy">📋 Copy</button></div><pre><code># Node: what depends on what
+npm ls --all | head -40
+npm ls &lt;vulnerable-package&gt;          # who pulls it in?
+npm explain &lt;vulnerable-package&gt;
+
+# Python
+pip install pipdeptree
+pipdeptree --reverse --packages flask</code></pre></div>
+
+<h3><span class="hn">17.10</span> Tool comparison</h3>
+<div class="tw"><table>
+<thead><tr><th>Tool</th><th>Scope</th><th>Speed</th><th>Output</th><th>Gate style</th></tr></thead>
+<tbody>
+<tr><td><code>npm audit</code></td><td>Node dependencies</td><td>seconds</td><td>text / JSON</td><td><code>--audit-level=high</code></td></tr>
+<tr><td><code>pip-audit</code></td><td>Python dependencies (OSV + PyPI)</td><td>seconds</td><td>text / JSON</td><td>exit code</td></tr>
+<tr><td><code>Trivy fs</code></td><td>Multi-ecosystem + IaC + secrets</td><td>seconds</td><td>table / JSON / SARIF</td><td><code>--exit-code 1 --severity</code></td></tr>
+<tr><td><code>Grype</code></td><td>Multi-ecosystem + images</td><td>seconds</td><td>table / JSON</td><td><code>--fail-on high</code></td></tr>
+<tr><td><strong>OWASP Dependency-Check</strong></td><td>Multi (JVM-heavy)</td><td>minutes — downloads the NVD</td><td>HTML / XML / SARIF</td><td>Jenkins publisher thresholds</td></tr>
+<tr><td><code>Snyk</code></td><td>Multi + licences + fix PRs</td><td>seconds</td><td>JSON / SARIF</td><td>SaaS policy</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">17.11</span> Lab — find a real vulnerability</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 17.1 · Add a vulnerable dependency, then gate it</span>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Deliberately install something with a known advisory</span><button class="copy">📋 Copy</button></div><pre><code># Node — install a package with a public advisory, e.g. an old lodash
+npm install lodash@4.17.15 --save
+npm audit --audit-level=high            # non-zero exit -&gt; your gate fires
+npm audit --json &gt; npm-audit.json       # keep the evidence
+npm uninstall lodash                    # clean up
+
+# Python — same idea
+pip install requests==2.19.1
+pip-audit -r requirements.txt           # reports known CVEs
+pip uninstall -y requests</code></pre></div>
+Then add the <em>SCA</em> stage to the pipeline and confirm the build fails. Finally, add a suppression with a justification and watch it pass:
+<div class="code" data-lang="yaml"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">yaml</span><span class="fn">.trivyignore (or Dependency-Check suppression.xml)</span><button class="copy">📋 Copy</button></div><pre><code># .trivyignore — every entry needs an owner, a reason and an expiry
+# Format: &lt;vuln-id&gt;  # reason  owner=@team  expires=YYYY-MM-DD
+CVE-2020-8203  # transitive via old tooling, not on a request path  owner=@platform  expires=2026-06-30</code></pre></div>
+</div>
+
+<h3><span class="hn">17.12</span> Secret scanning in depth</h3>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">gitleaks — configuration and pre-commit hook</span><button class="copy">📋 Copy</button></div><pre><code># .gitleaks.toml — allow-list for known-safe strings
+[extend]
+useDefault = true
+
+[[allowlist]]
+description = "local test fixtures"
+paths = ['''^tests/fixtures/.*''']
+
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.0
+    hooks:
+      - id: gitleaks</code></pre></div>
+<div class="dang"><span class="lbl"><span class="ic">🚨</span>If a secret reaches a remote branch, it is compromised</span>
+Deleting the commit does not un-leak it — bots scrape public repositories continuously, often within seconds. The only correct response is: <strong>rotate first</strong>, then purge history, then add the prevention layer (pre-commit hook plus CI gate).</div>
+
+<h3><span class="hn">17.13</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>Trivy vs OWASP Dependency-Check?</div><div class="a">Trivy is a single fast binary covering dependencies, containers, IaC and secrets with no database bootstrap — ideal for pipelines. Dependency-Check is JVM-based, downloads the NVD (slow first run, needs an NVD API key) and is common in regulated enterprises with existing suppression files. I would use Trivy for speed and Dependency-Check where compliance requires it.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>How do you keep false positives from blocking delivery?</div><div class="a">A version-controlled suppression file where every entry carries an owner, a reason and an expiry date, reviewed periodically. A suppression without justification is just a hidden risk.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>Should scans run on every commit?</div><div class="a">Fast ones, yes — <code>npm audit</code>, <code>pip-audit</code>, Trivy filesystem and gitleaks all run in seconds. Slow or noisy scans (full Dependency-Check, active DAST) go nightly, with the fast subset blocking every commit.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>How do you report security findings to developers?</div><div class="a">Publish machine-readable reports (SARIF or JSON) as build artifacts and trend them with Warnings NG, link the failing build in chat, and keep the finding next to the code that caused it. The goal is a thirty-second path from alert to offending line.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q10</span>What is SBOM-driven vulnerability management?</div><div class="a">Generate an SBOM at build time and store it alongside the artifact. When a new CVE appears you query your SBOMs instead of re-scanning everything, so you know within minutes which services are affected — exactly the capability that was missing during Log4Shell.</div></div>
+</div>
+
+<h3><span class="hn">17.9</span> Under the hood — how SCA finds vulnerabilities</h3>
+<p>SCA tools build a dependency graph — your direct dependencies plus every transitive one — map each package to a <strong>PURL</strong> (package URL) or <strong>CPE</strong> identifier, and look it up in vulnerability databases (GitHub Advisory DB, OSV, NVD, npm and PyPI advisories). Three practical consequences follow:</p>
+<ul>
+<li><strong>Transitive dependencies matter most.</strong> You rarely chose the vulnerable package; a dependency of a dependency did. That is why "we only use three libraries" is not a security argument.</li>
+<li><strong>Accuracy depends on identification.</strong> Wrong identifiers produce false positives — which is what suppression files are for, always with a written reason and an expiry date.</li>
+<li><strong>Not every CVE is exploitable.</strong> A vulnerable function you never call is lower priority than one on a request path. Triage by reachability, not by severity alone.</li>
+</ul>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">See the graph yourself</span><button class="copy">📋 Copy</button></div><pre><code># Node: what depends on what
+npm ls --all | head -40
+npm ls &lt;vulnerable-package&gt;          # who pulls it in?
+npm explain &lt;vulnerable-package&gt;
+
+# Python
+pip install pipdeptree
+pipdeptree --reverse --packages flask</code></pre></div>
+
+<h3><span class="hn">17.10</span> Tool comparison</h3>
+<div class="tw"><table>
+<thead><tr><th>Tool</th><th>Scope</th><th>Speed</th><th>Output</th><th>Gate style</th></tr></thead>
+<tbody>
+<tr><td><code>npm audit</code></td><td>Node dependencies</td><td>seconds</td><td>text / JSON</td><td><code>--audit-level=high</code></td></tr>
+<tr><td><code>pip-audit</code></td><td>Python dependencies (OSV + PyPI)</td><td>seconds</td><td>text / JSON</td><td>exit code</td></tr>
+<tr><td><code>Trivy fs</code></td><td>Multi-ecosystem + IaC + secrets</td><td>seconds</td><td>table / JSON / SARIF</td><td><code>--exit-code 1 --severity</code></td></tr>
+<tr><td><code>Grype</code></td><td>Multi-ecosystem + images</td><td>seconds</td><td>table / JSON</td><td><code>--fail-on high</code></td></tr>
+<tr><td><strong>OWASP Dependency-Check</strong></td><td>Multi (JVM-heavy)</td><td>minutes — downloads the NVD</td><td>HTML / XML / SARIF</td><td>Jenkins publisher thresholds</td></tr>
+<tr><td><code>Snyk</code></td><td>Multi + licences + fix PRs</td><td>seconds</td><td>JSON / SARIF</td><td>SaaS policy</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">17.11</span> Lab — find a real vulnerability</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 17.1 · Add a vulnerable dependency, then gate it</span>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Deliberately install something with a known advisory</span><button class="copy">📋 Copy</button></div><pre><code># Node — install a package with a public advisory, e.g. an old lodash
+npm install lodash@4.17.15 --save
+npm audit --audit-level=high            # non-zero exit -&gt; your gate fires
+npm audit --json &gt; npm-audit.json       # keep the evidence
+npm uninstall lodash                    # clean up
+
+# Python — same idea
+pip install requests==2.19.1
+pip-audit -r requirements.txt           # reports known CVEs
+pip uninstall -y requests</code></pre></div>
+Then add the <em>SCA</em> stage to the pipeline and confirm the build fails. Finally, add a suppression with a justification and watch it pass:
+<div class="code" data-lang="yaml"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">yaml</span><span class="fn">.trivyignore (or Dependency-Check suppression.xml)</span><button class="copy">📋 Copy</button></div><pre><code># .trivyignore — every entry needs an owner, a reason and an expiry
+# Format: &lt;vuln-id&gt;  # reason  owner=@team  expires=YYYY-MM-DD
+CVE-2020-8203  # transitive via old tooling, not on a request path  owner=@platform  expires=2026-06-30</code></pre></div>
+</div>
+
+<h3><span class="hn">17.12</span> Secret scanning in depth</h3>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">gitleaks — configuration and pre-commit hook</span><button class="copy">📋 Copy</button></div><pre><code># .gitleaks.toml — allow-list for known-safe strings
+[extend]
+useDefault = true
+
+[[allowlist]]
+description = "local test fixtures"
+paths = ['''^tests/fixtures/.*''']
+
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.0
+    hooks:
+      - id: gitleaks</code></pre></div>
+<div class="dang"><span class="lbl"><span class="ic">🚨</span>If a secret reaches a remote branch, it is compromised</span>
+Deleting the commit does not un-leak it — bots scrape public repositories continuously, often within seconds. The only correct response is: <strong>rotate first</strong>, then purge history, then add the prevention layer (pre-commit hook plus CI gate).</div>
+
+<h3><span class="hn">17.13</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>Trivy vs OWASP Dependency-Check?</div><div class="a">Trivy is a single fast binary covering dependencies, containers, IaC and secrets with no database bootstrap — ideal for pipelines. Dependency-Check is JVM-based, downloads the NVD (slow first run, needs an NVD API key) and is common in regulated enterprises with existing suppression files. I would use Trivy for speed and Dependency-Check where compliance requires it.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>How do you keep false positives from blocking delivery?</div><div class="a">A version-controlled suppression file where every entry carries an owner, a reason and an expiry date, reviewed periodically. A suppression without justification is just a hidden risk.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>Should scans run on every commit?</div><div class="a">Fast ones, yes — <code>npm audit</code>, <code>pip-audit</code>, Trivy filesystem and gitleaks all run in seconds. Slow or noisy scans (full Dependency-Check, active DAST) go nightly, with the fast subset blocking every commit.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>How do you report security findings to developers?</div><div class="a">Publish machine-readable reports (SARIF or JSON) as build artifacts and trend them with Warnings NG, link the failing build in chat, and keep the finding next to the code that caused it. The goal is a thirty-second path from alert to offending line.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q10</span>What is SBOM-driven vulnerability management?</div><div class="a">Generate an SBOM at build time and store it alongside the artifact. When a new CVE appears you query your SBOMs instead of re-scanning everything, so you know within minutes which services are affected — exactly the capability that was missing during Log4Shell.</div></div>
+</div>
+</section>

@@ -1,0 +1,319 @@
+<section class="block" id="block-21" data-block="21" data-title="Parallel, matrix, timeout, retry, lock">
+    <div class="bhead"><div class="bnum">21</div><div>
+      <div class="bl">Block 21 · DevSecOps &amp; scale</div>
+      <h2>Parallel, matrix, timeouts, retries &amp; locks</h2>
+      <p class="bgoal"><b>Goal:</b> make pipelines fast (parallelism, matrix) and safe under concurrency (timeouts, retries, locks, milestones).</p>
+    </div></div>
+
+    <h3><span class="hn">21.1</span> Parallel stages</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Declarative parallel block</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent none
+
+    stages {
+        stage('Checkout') {
+            agent { label 'linux' }
+            steps { checkout scm }
+        }
+
+        stage('Quality &amp; Security') {
+            failFast true                       // one failure cancels the siblings
+            parallel {
+                stage('Unit tests') {
+                    agent { label 'linux' }
+                    steps { sh 'npm run test:junit' }
+                }
+                stage('Lint') {
+                    agent { label 'linux' }
+                    steps { sh 'npm run lint' }
+                }
+                stage('Dependency scan') {
+                    agent { label 'linux' }
+                    steps { sh 'trivy fs --exit-code 1 --severity HIGH,CRITICAL .' }
+                }
+                stage('Secret scan') {
+                    agent { label 'linux' }
+                    steps { sh 'gitleaks detect --source . --redact' }
+                }
+            }
+        }
+
+        stage('Package') {
+            agent { label 'docker' }
+            steps { sh 'docker build -t app:$GIT_SHA .' }
+        }
+    }
+}</code></pre></div>
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>Parallel needs executors</span>
+    Four parallel stages need four free executors (or four agents). With two executors they simply queue and you gain nothing — parallelism is bought with infrastructure, not syntax. Check <em>Manage Jenkins → Nodes</em> before promising a 4× speed-up.</div>
+
+    <h3><span class="hn">21.2</span> Parallel in scripted style (when you need dynamic branches)</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Build a parallel map at runtime</span><button class="copy">📋 Copy</button></div><pre><code>stage('Test both apps') {
+    steps {
+        script {
+            def apps = ['nodejs-app': 'node', 'python-app': 'python']
+            def branches = apps.collectEntries { name, type -&gt;
+                ["${name}": {
+                    node('linux') {
+                        dir(name) {
+                            runTests(type: type, minCoverage: 70)   // shared library step (Block 14)
+                        }
+                    }
+                }]
+            }
+            parallel branches
+        }
+    }
+}</code></pre></div>
+
+    <h3><span class="hn">21.3</span> Matrix — the same job across many combinations</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Matrix with axes, excludes and per-cell behaviour</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent none
+
+    stages {
+        stage('Cross-platform tests') {
+            matrix {
+                axes {
+                    axis { name 'NODE_VERSION'; values '18', '20', '22' }
+                    axis { name 'OS';           values 'linux', 'alpine' }
+                }
+                excludes {
+                    exclude {   // Node 18 on alpine isn't supported by this project
+                        axis { name 'NODE_VERSION'; values '18' }
+                        axis { name 'OS';           values 'alpine' }
+                    }
+                }
+                agent { docker { image "node:${NODE_VERSION}-${OS}"; reuseNode true } }
+                stages {
+                    stage('Test') {
+                        steps {
+                            echo "Testing on Node ${NODE_VERSION} / ${OS}"
+                            sh 'node -v &amp;&amp; npm ci &amp;&amp; npm run test:junit'
+                        }
+                    }
+                }
+            }
+        }
+    }
+}</code></pre></div>
+    <div class="tip"><span class="lbl"><span class="ic">🧪</span>Real-world matrix uses</span>
+    Test across Node/Python versions, OSes and architectures; run the same smoke suite against multiple target environments; build multi-arch images (<code>linux/amd64</code>, <code>linux/arm64</code>) in parallel and combine them into one manifest.</div>
+
+    <h3><span class="hn">21.4</span> Timeouts, retries and waiting</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">The resilience toolkit</span><button class="copy">📋 Copy</button></div><pre><code>// Pipeline-wide safety net
+options { timeout(time: 45, unit: 'MINUTES') }
+
+// Per-stage override
+stage('Long scan') {
+    options { timeout(time: 15, unit: 'MINUTES') }
+    steps { sh 'trivy image --exit-code 1 app:latest' }
+}
+
+steps {
+    retry(3) {                                   // retry the exact same block, 3 times
+        sh 'docker pull node:20-alpine'
+    }
+
+    retry(count: 5, conditions: [               // only retry on specific causes
+        agent(), nonresumable()
+    ]) {
+        node('flaky-agent') { sh 'true' }
+    }
+
+    waitUntil {                                  // poll until the block returns true
+        def ok = sh(script: 'curl -fsS http://localhost:3000/health', returnStatus: true) == 0
+        sleep(time: 3, unit: 'SECONDS')
+        return ok
+    }
+
+    timeout(time: 2, unit: 'MINUTES') {          // hard cap on any of the above
+        waitUntil { sh(script: 'curl -fsS http://localhost:3000/health', returnStatus: true) == 0 }
+    }
+
+    sleep(time: 10, unit: 'SECONDS')             // simple pause
+}</code></pre></div>
+
+    <h3><span class="hn">21.5</span> Locks — serialising shared resources</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Lockable Resources plugin</span><button class="copy">📋 Copy</button></div><pre><code>// Define resources: Manage Jenkins -> System -> Lockable Resources
+//   Name: deploy-prod     (quantity 1)
+//   Name: test-database   (quantity 3)
+
+stage('Deploy to production') {
+    steps {
+        lock(resource: 'deploy-prod') {          // only one prod deploy at a time
+            sh './deploy.sh prod'
+        }
+    }
+}
+
+stage('Integration tests') {
+    steps {
+        lock(label: 'test-database', quantity: 1, variable: 'DB_RESOURCE') {
+            echo "Using database resource: ${env.DB_RESOURCE}"
+            sh 'pytest tests/integration'
+        }
+    }
+}
+
+// Inverse: block concurrent runs of THIS job
+options { disableConcurrentBuilds() }
+
+// Or: kill the older build when a new one starts
+options {
+    disableConcurrentBuilds(abortPrevious: true)
+}</code></pre></div>
+
+    <h3><span class="hn">21.6</span> Milestones — correct ordering of concurrent builds</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Milestone + lock for sane deploy ordering</span><button class="copy">📋 Copy</button></div><pre><code>stage('Deploy') {
+    steps {
+        milestone 1                       // build #5 reaches this first
+        lock(resource: 'deploy-prod') {
+            milestone 2                   // older builds that reach here are cancelled
+            sh './deploy.sh'
+        }
+    }
+}</code></pre></div>
+    <p>Two pushes land close together. Without milestones, the older build could deploy <em>after</em> the newer one and silently roll you back. <code>milestone</code> cancels any build that is behind — exactly the semantics you want for a deploy stage.</p>
+
+    <h3><span class="hn">21.7</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>A parallel block runs 3+ checks simultaneously and <code>failFast</code> behaves as expected.</li>
+      <li>A matrix runs the same tests across multiple Node/Python versions.</li>
+      <li>Every long-running stage has a timeout; flaky network steps have <code>retry</code>.</li>
+      <li>Prod deploy is protected by a lock (and ideally a milestone).</li>
+    </ul>
+
+    <h3><span class="hn">21.8</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>How do you speed up a slow Jenkins pipeline?</div><div class="a">Run independent work in a <code>parallel</code> block (tests, lint, scans), put the fastest and most-likely-to-fail checks first, use a matrix instead of sequential loops, cache dependencies and Docker layers, and make sure there are enough executors to actually run things concurrently.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>How do you handle flaky steps?</div><div class="a"><code>retry(n)</code> for genuinely transient operations like registry pulls or network calls, and <code>waitUntil</code> for polling a service until it's ready. I do <em>not</em> use retry to hide flaky tests — those get quarantined and fixed, because retry only delays the failure.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>How do you prevent two deployments running at once?</div><div class="a"><code>lock(resource: 'deploy-prod')</code> from the Lockable Resources plugin so only one build holds the deploy slot. Combined with <code>milestone</code>, an older build that arrives late is cancelled instead of rolling the environment backwards.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>What does <code>disableConcurrentBuilds</code> do, and what's the alternative?</div><div class="a">It queues new runs while one is in progress. With <code>abortPrevious: true</code> the older run is cancelled instead — usually what you want on a fast-moving main branch, while for deployments you'd prefer queuing so every release is actually attempted.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q5</span>When would you use <code>matrix</code> over <code>parallel</code>?</div><div class="a">When the branches are the <em>same work</em> across different dimensions — Node 18/20/22 × linux/alpine. Matrix gives me a compact declaration, automatic naming, exclusions for unsupported combinations, and per-cell results in one view, instead of me hand-writing six near-identical parallel stages.</div></div>
+    </div>
+
+<h3><span class="hn">21.8</span> Under the hood — the master/agent file path contract</h3>
+<div class="warn"><span class="lbl"><span class="ic">⚠️</span>The single most expensive mistake in Jenkins pipelines</span>
+Using <code>File</code>, <code>new FileOutputStream</code>, <code>Paths.get</code> or <code>Files.*</code> in pipeline code operates on the <strong>controller's</strong> filesystem, not the agent's workspace. It appears to work when you test on a single-machine install, then silently reads or writes the wrong machine in production — and can corrupt <span class="path">$JENKINS_HOME</span>. Always use pipeline steps: <code>readFile</code>, <code>writeFile</code>, <code>sh</code>, <code>findFiles</code>, <code>archiveArtifacts</code>.</div>
+<div class="tw"><table>
+<thead><tr><th>Instead of this (Java/Groovy)</th><th>Use this (pipeline step)</th></tr></thead>
+<tbody>
+<tr><td><code>new File(path).text</code></td><td><code>readFile(path)</code></td></tr>
+<tr><td><code>new File(path).write(...)</code></td><td><code>writeFile(file:…, text:…)</code> or <code>sh 'cat &gt; …'</code></td></tr>
+<tr><td><code>file.eachLine {}</code></td><td><code>readFile(...).split('\n')</code> or <code>sh '…'</code> returning text</td></tr>
+<tr><td><code>new File(p).exists()</code></td><td><code>fileExists(p)</code></td></tr>
+<tr><td><code>dir.listFiles()</code></td><td><code>findFiles(glob: '**/*.json')</code></td></tr>
+<tr><td><code>new File(p).delete()</code></td><td><code>sh 'rm -f …'</code> or <code>deleteDir()</code></td></tr>
+<tr><td><code>new XmlSlurper().parse(f)</code></td><td><code>readJSON</code> / <code>readMavenPom</code> / parse with <code>sh 'jq'</code></td></tr>
+</tbody>
+</table></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">findFiles — the agent-safe way to enumerate</span><button class="copy">📋 Copy</button></div><pre><code>steps {
+    script {
+        def reports = findFiles(glob: '**/coverage/*.xml')
+        echo "Found ${reports.length} coverage reports"
+        reports.each { f -&gt;
+            echo "${f.path} (${f.length} bytes, dir=${f.directory})"
+        }
+        if (reports.length == 0) { error 'No coverage report - failing fast' }
+    }
+}</code></pre></div>
+
+<h3><span class="hn">21.9</span> CPS deep dive — what breaks and why</h3>
+<div class="tw"><table>
+<thead><tr><th>Construct</th><th>Status in CPS</th><th>What to do</th></tr></thead>
+<tbody>
+<tr><td><code>for (i in list)</code>, <code>each {}</code></td><td>Safe</td><td>Preferred</td></tr>
+<tr><td>Closures like <code>{ it -&gt; ... }</code></td><td>Safe</td><td>Preferred</td></tr>
+<tr><td>Java streams / <code>.parallelStream()</code></td><td><strong>Unsupported</strong></td><td>Use a loop or <code>@NonCPS</code></td></tr>
+<tr><td><code>while(true)</code> without body checkpoint</td><td>Risky (infinite loop blocks CPS)</td><td>Add a bounded counter</td></tr>
+<tr><td>Recursion</td><td>Risky (stack depth)</td><td>Prefer iteration</td></tr>
+<tr><td>Anonymous inner classes</td><td>Not supported</td><td>Move to <span class="path">src/</span> or <code>@NonCPS</code></td></tr>
+<tr><td><code>try/catch/finally</code></td><td>Safe</td><td>Use it</td></tr>
+<tr><td>Exceptions crossing <code>node</code></td><td>Must be serializable</td><td>Catch inside the same <code>node</code> block</td></tr>
+</tbody>
+</table></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">The @NonCPS escape hatch, used correctly</span><button class="copy">📋 Copy</button></div><pre><code>// Runs as plain Groovy on the controller -- NO pipeline steps allowed inside.
+// Perfect for string/JSON munging that would otherwise confuse CPS.
+@NonCPS
+String renderMarkdownTable(String json) {
+    def rows = new groovy.json.JsonSlurper().parseText(json)
+    def sb = new StringBuilder()
+    sb.append('| Service | Version |\n|---|---|\n')
+    rows.each { r -&gt; sb.append("| ${r.name} | ${r.version} |\n") }
+    return sb.toString()                       // return a plain String
+}
+
+pipeline {
+    agent any
+    stages {
+        stage('Report') {
+            steps {
+                script {
+                    def raw = sh(script: 'cat versions.json', returnStdout: true).trim()
+                    def table = renderMarkdownTable(raw)     // call it from CPS code
+                    writeFile file: 'report.md', text: table
+                }
+            }
+        }
+    }
+}</code></pre></div>
+<div class="dang"><span class="lbl"><span class="ic">🚨</span>Rule</span>
+Inside an <code>@NonCPS</code> method you may <strong>not</strong> call <code>sh</code>, <code>echo</code>, <code>readFile</code> or any other pipeline step — they will throw or silently do nothing. Keep <code>@NonCPS</code> for pure computation, and do the I/O in CPS code.</div>
+
+<h3><span class="hn">21.10</span> Lab — reproduce a real production failure</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 21.2 · The file that isn't there</span>
+Run this on a controller with a separate agent:
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Deliberately wrong, then corrected</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent { label 'linux' }                 // runs on the AGENT
+    stages {
+        stage('Broken') {
+            steps {
+                script {
+                    // WRONG: touches the CONTROLLER filesystem
+                    def f = new File('/tmp/agent-proof.txt')
+                    f.text = 'written from the pipeline'
+                    echo "exists? ${f.exists()}"       // true -- on the controller!
+                }
+            }
+        }
+        stage('Fixed') {
+            steps {
+                // RIGHT: runs where the workspace is
+                sh 'echo "written from the pipeline" &gt; /tmp/agent-proof.txt &amp;&amp; cat /tmp/agent-proof.txt'
+                writeFile file: 'proof.txt', text: 'written via writeFile'
+                echo readFile('proof.txt')
+            }
+        }
+    }
+}</code></pre></div>
+Then SSH to the agent: <code>/tmp/agent-proof.txt</code> exists there. SSH to the controller: it does not. Meanwhile the <code>new File</code> version created the file on the controller. Once you have seen this once, you will never use <code>new File</code> in a pipeline again.</div>
+
+<h3><span class="hn">21.11</span> Performance: make pipelines fast</h3>
+<div class="tw"><table>
+<thead><tr><th>Technique</th><th>Typical gain</th><th>How</th></tr></thead>
+<tbody>
+<tr><td>Parallelise independent stages</td><td>2–5×</td><td><code>parallel</code> for build/lint/SCA/SAST as we do</td></tr>
+<tr><td>Cache dependencies outside the workspace</td><td>50–80% of install time</td><td><code>/.npm</code> and <code>/.cache/pip</code> mounts outside the workspace</td></tr>
+<tr><td>Skip unchanged work</td><td>Large on monorepos</td><td><code>when { changeset 'nodejs-app/**' }</code></td></tr>
+<tr><td>Keep agents warm</td><td>Removes cold-start</td><td>Long-lived agents or a warm image pool</td></tr>
+<tr><td>Avoid <code>agent none</code> thrash</td><td>Seconds per stage</td><td>Group steps that can share one agent</td></tr>
+<tr><td>Shrink Docker context</td><td>Seconds to minutes</td><td><code>.dockerignore</code></td></tr>
+<tr><td>Fail fast</td><td>Huge on broken commits</td><td>Cheap stages first: lint, then test, then scans</td></tr>
+</tbody>
+</table></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Cheapest-first ordering — fail in 40 seconds, not 12 minutes</span><button class="copy">📋 Copy</button></div><pre><code>stages {
+    stage('Lint')  { steps { sh 'npm run lint' } }        // ~20s
+    stage('Unit')  { steps { sh 'npm test' } }            // ~60s
+    stage('Build') { steps { sh 'npm run build' } }       // ~90s
+    stage('Scans') { steps { sh 'trivy fs .' } }          // ~120s
+    stage('Image') { steps { sh 'docker build ...' } }    // ~180s
+}</code></pre></div>
+
+<h3><span class="hn">21.12</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>Why must pipeline variables be serializable?</div><div class="a">Because durable pipelines persist state to disk at every checkpoint so a build can survive a controller restart. Any object captured in the CPS state — including exceptions you let escape a <code>node</code> block — must be serializable. Non-serializable objects cause "java.io.NotSerializableException" at exactly the worst moment.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>When do you reach for <code>@NonCPS</code>?</div><div class="a">Only for pure computation that CPS cannot express — Java streams, regex-heavy string work, JSON/XML parsing — and never for anything that calls pipeline steps. It runs as ordinary Groovy on the controller, which also means it must be cheap and must not touch the filesystem.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>How do you debug a pipeline that only fails on the agent?</div><div class="a">Reproduce inside the same container with <code>docker run --rm -it -v $PWD:/w -w /w node:20-alpine sh</code>, dump the environment with <code>sh 'env | sort'</code>, compare users and paths (<code>id</code>, <code>pwd</code>), and check that anything the build needs is actually installed in the image rather than on the long-lived host.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>How do you make a slow pipeline faster without adding risk?</div><div class="a">Measure first — the Pipeline Timing or Blue Ocean view shows where the minutes go. Then parallelise independent stages, cache dependencies outside the workspace, order stages cheapest-first so failures surface in under a minute, and skip work that the changed paths cannot affect.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q10</span>What is the risk of running builds on the controller?</div><div class="a">Everything the build does runs with controller privileges, has access to <span class="path">$JENKINS_HOME</span> and all credentials, and competes with the UI for CPU and memory — a runaway build can take CI down for everyone. I set the built-in node to zero executors and run all builds on agents.</div></div>
+</div>
+</section>

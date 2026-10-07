@@ -1,0 +1,288 @@
+<section class="block" id="block-24" data-block="24" data-title="Interview kit · 70 Q&amp;A">
+    <div class="bhead"><div class="bnum">24</div><div>
+      <div class="bl">Block 24 · Operations &amp; interviews</div>
+      <h2>Interview kit — cheat sheet, scenarios &amp; the 60-second pitch</h2>
+      <p class="bgoal"><b>Goal:</b> convert everything you built into confident answers. Read this the night before the interview, and again in the parking lot.</p>
+    </div></div>
+
+    <h3><span class="hn">24.1</span> The 60-second pitch <small>(memorise this)</small></h3>
+    <div class="code" data-lang="text"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">script</span><span class="fn">"Tell me about your Jenkins project"</span><button class="copy">📋 Copy</button></div><pre><code>"I built a complete CI/CD platform on Jenkins LTS running on an AWS EC2 Ubuntu
+instance. It has two production-shaped services - an Express API and a Flask API -
+each with its own Jenkinsfile in a monorepo.
+
+On every push, a GitHub webhook triggers the pipeline: Jenkins checks out the
+branch, installs dependencies deterministically (npm ci / pinned requirements),
+runs unit tests with coverage gates, and publishes JUnit and coverage reports.
+
+Then the DevSecOps layer: SonarQube SAST with a quality gate that blocks bad
+code, Trivy and npm audit / pip-audit for dependency CVEs, gitleaks for secrets,
+and a container scan plus SBOM generation and cosign signing before the image is
+pushed to Docker Hub tagged with the Git SHA.
+
+Deployment goes over SSH with docker compose, gated by a manual approval and a
+health check, with automatic rollback to the previous successful build.
+
+The infrastructure side: the controller has zero executors and dispatches to
+labelled agents, reusable logic lives in a shared library, Multibranch
+pipelines build every branch and PR automatically, access is controlled with
+Role-Based Authorization, and the whole thing is backed up nightly with a
+tested restore.
+
+Everything is in Git - Jenkinsfiles, shared library, Dockerfiles, plugin
+manifest - so I can rebuild the entire CI system from scratch."</code></pre></div>
+    <div class="tip"><span class="lbl"><span class="ic">🎯</span>Why this pitch works</span>
+    It names the <strong>stack</strong>, the <strong>trigger</strong>, the <strong>quality gates</strong>, the <strong>security layers</strong>, the <strong>deployment and rollback</strong>, and the <strong>operational concerns</strong> — in under a minute. Each clause is a hook the interviewer will pull on, and you have a block of this document behind every one.</div>
+
+    <h3><span class="hn">24.2</span> Rapid-fire: 25 questions you must answer instantly</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">1</span>Controller vs agent?</div><div class="a">Controller orchestrates and stores everything; agents execute builds. Controller executors = 0 in production.</div></div>
+      <div class="qa"><div class="q"><span class="qn">2</span>Executor?</div><div class="a">A slot for one concurrent build. N executors = N parallel builds on that node.</div></div>
+      <div class="qa"><div class="q"><span class="qn">3</span>Mandatory declarative blocks?</div><div class="a"><code>pipeline</code>, <code>agent</code>, <code>stages</code>; each <code>stage</code> needs <code>steps</code>.</div></div>
+      <div class="qa"><div class="q"><span class="qn">4</span>Declarative vs Scripted?</div><div class="a">Declarative is structured and validated; scripted is raw Groovy. Use declarative, escape to <code>script { }</code>.</div></div>
+      <div class="qa"><div class="q"><span class="qn">5</span>Where is data stored?</div><div class="a"><span class="path">$JENKINS_HOME</span> = <span class="path">/var/lib/jenkins</span>.</div></div>
+      <div class="qa"><div class="q"><span class="qn">6</span>How do you generate step syntax?</div><div class="a">Snippet Generator at <span class="path">/pipeline-syntax/</span>; directives at <span class="path">/directive-generator/</span>.</div></div>
+      <div class="qa"><div class="q"><span class="qn">7</span>What is Replay for?</div><div class="a">Rerun a build with an edited Jenkinsfile without committing.</div></div>
+      <div class="qa"><div class="q"><span class="qn">8</span><code>npm ci</code> vs <code>npm install</code>?</div><div class="a"><code>ci</code> installs exactly from the lockfile and fails on mismatch — deterministic, therefore correct for CI.</div></div>
+      <div class="qa"><div class="q"><span class="qn">9</span>SUCCESS vs UNSTABLE vs FAILURE?</div><div class="a">Passed / completed but below quality bar / errored.</div></div>
+      <div class="qa"><div class="q"><span class="qn">10</span>How do you publish test results?</div><div class="a"><code>junit testResults: 'reports/junit.xml'</code> plus <code>recordCoverage</code>.</div></div>
+      <div class="qa"><div class="q"><span class="qn">11</span><code>env.X</code> vs <code>params.X</code>?</div><div class="a">Environment variables are set by/in the pipeline; parameters are user inputs shown in "Build with Parameters".</div></div>
+      <div class="qa"><div class="q"><span class="qn">12</span>How are secrets stored?</div><div class="a">Credentials store, encrypted with <span class="path">master.key</span>, referenced by ID, injected with <code>withCredentials</code>, masked in logs.</div></div>
+      <div class="qa"><div class="q"><span class="qn">13</span>How do you fail a build deliberately?</div><div class="a"><code>error 'message'</code>, or a non-zero exit from <code>sh</code>.</div></div>
+      <div class="qa"><div class="q"><span class="qn">14</span>Your image tagging strategy?</div><div class="a">Git SHA (immutable) + build number + <code>latest</code> for dev only. Deploy by SHA/digest.</div></div>
+      <div class="qa"><div class="q"><span class="qn">15</span>Why not give Jenkins the Docker socket?</div><div class="a">It's root-equivalent. Prefer Kaniko, rootless BuildKit, or ephemeral agents.</div></div>
+      <div class="qa"><div class="q"><span class="qn">16</span>Webhook vs polling?</div><div class="a">Webhook = instant push notification; polling = Jenkins asks periodically. Webhooks if reachable, polling if not.</div></div>
+      <div class="qa"><div class="q"><span class="qn">17</span>What does <code>H</code> mean in cron?</div><div class="a">A hash of the job name that staggers schedules to avoid a thundering herd.</div></div>
+      <div class="qa"><div class="q"><span class="qn">18</span><code>always</code> vs <code>cleanup</code>?</div><div class="a">Both always run; <code>cleanup</code> runs last, even if <code>always</code> failed.</div></div>
+      <div class="qa"><div class="q"><span class="qn">19</span>How do you implement RBAC?</div><div class="a">Role Strategy plugin: global roles, item roles by name pattern/folder, agent roles; least privilege.</div></div>
+      <div class="qa"><div class="q"><span class="qn">20</span>What is a shared library?</div><div class="a">A Git repo of Groovy (<span class="path">vars/</span> → steps, <span class="path">src/</span> → classes) imported with <code>@Library('name@version') _</code>.</div></div>
+      <div class="qa"><div class="q"><span class="qn">21</span>Multibranch pipeline?</div><div class="a">One job that discovers branches/PRs and builds each one's Jenkinsfile automatically.</div></div>
+      <div class="qa"><div class="q"><span class="qn">22</span>SAST vs SCA vs DAST?</div><div class="a">Source code / dependencies / running application.</div></div>
+      <div class="qa"><div class="q"><span class="qn">23</span>What is an SBOM?</div><div class="a">A machine-readable inventory of everything in your artifact (CycloneDX/SPDX) — instant CVE impact answers.</div></div>
+      <div class="qa"><div class="q"><span class="qn">24</span>How do you add a manual approval?</div><div class="a"><code>input</code> inside <code>timeout()</code>, restricted by <code>submitter</code>, in a stage with <code>agent none</code>.</div></div>
+      <div class="qa"><div class="q"><span class="qn">25</span>How do you stop two deploys colliding?</div><div class="a"><code>lock(resource: 'deploy-prod')</code> plus <code>milestone</code> for ordering.</div></div>
+    </div>
+
+    <h3><span class="hn">24.3</span> Scenario questions (the ones that decide the offer)</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">S1</span>"Production is down after a deploy that passed all tests. What do you do?"</div><div class="a">Roll back first, diagnose second: redeploy the previous successful build's tag (<code>kubectl rollout undo</code> / compose with the old tag) to restore service. Then read the deploy log and health-check output, compare the deployed digest with what was scanned, and check for a migration or config change. Then add the missing guard — smoke tests after deploy, a canary step, or a DB-migration compatibility check — so the same class of failure can't ship again.</div></div>
+      <div class="qa"><div class="q"><span class="qn">S2</span>"The team complains CI takes 40 minutes. Fix it."</div><div class="a">Measure first: Timestamper + Stage View to find the slow stages. Then run independent work in parallel (tests, lint, scans), cache dependencies outside the workspace and Docker layers with <code>--cache-from</code>, put the fastest failing checks first, and make sure enough executors exist to actually parallelise. Finally cap it with per-stage timeouts so a hang never costs 40 minutes again.</div></div>
+      <div class="qa"><div class="q"><span class="qn">S3</span>"Developers can see other teams' credentials. How?"</div><div class="a">Because credentials are global and everyone has read/configure rights. Fix: folders per team, credentials stored in folder domains, item roles scoped to folder patterns, anonymous access off, and an audit trail. Then rotate anything that was exposed.</div></div>
+      <div class="qa"><div class="q"><span class="qn">S4</span>"A secret was pushed to Git. Now what?"</div><div class="a">Rotate the secret first — assume it's compromised the moment it's public, because deleting the commit doesn't un-leak it. Then purge it from history (<code>git filter-repo</code> or BFG) and force-push with team coordination. Then prevent recurrence: gitleaks as a pre-commit hook and a blocking CI gate.</div></div>
+      <div class="qa"><div class="q"><span class="qn">S5</span>"You need to onboard 30 repositories. Manual job creation?"</div><div class="a">No. A GitHub Organization folder with the Branch Source plugin scans the org and creates multibranch jobs for every repo containing a Jenkinsfile. Standardise on a shared library (<code>standardPipeline { }</code>) so each repo's Jenkinsfile is a few lines, and use JCasC plus a plugin manifest to make the controller itself reproducible.</div></div>
+      <div class="qa"><div class="q"><span class="qn">S6</span>"Jenkins is down. How long until you're back?"</div><div class="a">Restore from the nightly backup onto a fresh box (or apply JCasC + the plugin manifest), restore <span class="path">master.key</span>, start, verify agents reconnect and one pipeline per project runs. Because Jenkinsfiles live in Git, no pipeline logic is ever lost — the recovery target is minutes, not days, and I test the restore regularly.</div></div>
+      <div class="qa"><div class="q"><span class="qn">S7</span>"How would you convince a team to adopt security scanning?"</div><div class="a">Roll it out in phases so it never feels like a blocker: report-only first (visibility), then a soft gate (unstable), then a hard gate restricted to <strong>new code</strong>. Show the numbers — issues found before release vs. after. The pitch is "we catch it in 3 minutes instead of 3 weeks", not "compliance says so".</div></div>
+    </div>
+
+    <h3><span class="hn">24.4</span> Resume / LinkedIn bullet points</h3>
+    <div class="code" data-lang="text"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">text</span><span class="fn">Copy-adapt these (make them true for you first)</span><button class="copy">📋 Copy</button></div><pre><code>• Designed and operated a Jenkins LTS CI/CD platform on AWS EC2 (Ubuntu 24.04,
+  Java 21) serving a Node.js and a Python microservice from one monorepo.
+
+• Authored Declarative Pipelines (Jenkinsfile) implementing checkout → build →
+  test → SAST/SCA → container scan → push → approve → deploy → rollback,
+  triggered by GitHub webhooks with sub-10-second build start.
+
+• Reduced feedback time ~60% by parallelising test, lint and security stages and
+  caching dependencies and Docker layers outside the workspace.
+
+• Embedded DevSecOps gates: SonarQube quality gate on new code, Trivy image and
+  filesystem scanning, npm audit / pip-audit, gitleaks secret detection, SBOM
+  generation (Syft/CycloneDX) and cosign image signing on release branches.
+
+• Standardised 20+ pipelines with a versioned Jenkins Shared Library
+  (vars/ + src/), cutting per-repo pipeline code from ~150 lines to ~10.
+
+• Implemented least-privilege access with the Role-Based Authorization Strategy
+  plugin, folder-scoped credentials, zero-executor controller and labelled SSH
+  and Docker agents.
+
+• Automated deployment with docker compose over SSH behind a manual approval
+  gate, with automated health checks and rollback to the last successful build.
+
+• Established operational practice: nightly JENKINS_HOME backups with a tested
+  restore procedure, build-discarder and workspace-cleanup policies, and a
+  documented six-step upgrade process.</code></pre></div>
+
+    <h3><span class="hn">24.5</span> Questions to ask <em>them</em> (signals seniority)</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Ask</th><th>What the answer tells you</th></tr></thead>
+      <tbody>
+        <tr><td>"How many pipelines and how many agents do you run today?"</td><td>Scale of the problem — and whether they're agent-starved</td></tr>
+        <tr><td>"Is Jenkins managed as code (JCasC / plugin manifest) or configured by hand?"</td><td>Maturity. Hand-configured = your first win</td></tr>
+        <tr><td>"Where do secrets live, and how are they rotated?"</td><td>Security culture (and a chance to mention credentials + folder scoping)</td></tr>
+        <tr><td>"What happens when a deploy fails — is rollback automated?"</td><td>Whether they have a real CD practice or just CI</td></tr>
+        <tr><td>"Do security scans block the build or just report?"</td><td>DevSecOps maturity; lets you share the phased rollout story</td></tr>
+        <tr><td>"Who owns Jenkins — a platform team or each squad?"</td><td>Whether shared libraries and RBAC will be valued</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">24.6</span> The cheat sheet — every syntax you need on one screen</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Jenkins declarative quick reference</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+  agent any | none | { label 'x' } | { docker { image 'node:20'; args '-v a:b'; reuseNode true } }
+           | { dockerfile { filename 'Dockerfile.ci' } } | { node { label 'x'; customWorkspace '/p' } }
+
+  options { timestamps()  timeout(time:30, unit:'MINUTES')  retry(2)
+            buildDiscarder(logRotator(numToKeepStr:'30'))  disableConcurrentBuilds()
+            skipDefaultCheckout(true)  ansiColor('xterm') }
+
+  parameters { string(name:'A', defaultValue:'x')  choice(name:'B', choices:['a','b'])
+               booleanParam(name:'C', defaultValue:true)  text(name:'D', defaultValue:'')
+               password(name:'E', defaultValue:'') }
+
+  triggers { pollSCM('H/5 * * * *')  cron('H 2 * * *')  githubPush()
+             upstream(upstreamProjects:'other', threshold: hudson.model.Result.SUCCESS) }
+
+  tools { nodejs 'node20'  jdk 'jdk21'  maven 'maven3' }
+
+  environment { A = 'value'  B = credentials('cred-id')  T = "${sh(returnStdout:true,script:'date +%s').trim()}" }
+
+  libraries { lib('my-shared-lib@main') }        // or @Library('my-shared-lib@main') _ above
+
+  stages {
+    stage('Name') {
+      when { branch 'main'  changeRequest()  expression { params.X }
+             allOf { … }  anyOf { … }  not { … }
+             beforeAgent true  beforeInput true }
+      agent { … }                                 // per-stage agent when pipeline has agent none
+      options { timeout(time:5, unit:'MINUTES')  retry(3) }
+      environment { STAGE_VAR = 'x' }
+      steps {
+        sh 'cmd'   sh(script:'cmd', returnStdout:true).trim()   sh(script:'cmd', returnStatus:true)
+        echo 'text'   dir('sub') { … }   deleteDir()   sleep(time:5, unit:'SECONDS')
+        script { /* any Groovy */ }
+        checkout scm   git branch:'main', url:'…', credentialsId:'…'
+        withEnv(['X=1']) { … }
+        withCredentials([usernamePassword(credentialsId:'c', usernameVariable:'U', passwordVariable:'P')]) { … }
+        sshagent(['deploy-key']) { … }
+        withSonarQubeEnv('sonar') { … }   waitForQualityGate()
+        docker.build('img:tag', '--pull .')   docker.withRegistry('url','creds') { img.push() }
+        junit testResults:'reports/junit.xml', allowEmptyResults:true
+        recordCoverage tools:[[parser:'COBERTURA', pattern:'coverage.xml']]
+        archiveArtifacts artifacts:'x/**', allowEmptyArchive:true, fingerprint:true
+        stash name:'s', includes:'src/**'   unstash 's'
+        retry(3) { … }   timeout(time:2, unit:'MINUTES') { … }   waitUntil { … }
+        lock(resource:'deploy-prod') { … }   milestone 1
+        input message:'Deploy?', ok:'Go', submitter:'lead', submitterParameter:'WHO'
+        build job:'other', parameters:[string(name:'X', value:'y')], wait:true, propagate:false
+        catchError(buildResult:'UNSTABLE', stageResult:'FAILURE') { … }
+        error 'stop here'
+      }
+      post { always { } success { } failure { } }
+    }
+
+    stage('Parallel work') {
+      failFast true
+      parallel { stage('a') { steps { … } }  stage('b') { steps { … } } }
+    }
+  }
+
+  post {
+    always { }  changed { }  aborted { }  regression { }  fixed { }
+    success { }  failure { }  unstable { }  unsuccessful { }
+    cleanup { cleanWs() }
+  }
+}</code></pre></div>
+
+    <div class="note"><span class="lbl"><span class="ic">📌</span>Environment variables cheat sheet</span>
+    <code>env.BUILD_NUMBER</code> · <code>env.BUILD_URL</code> · <code>env.BUILD_TAG</code> · <code>env.JOB_NAME</code> · <code>env.WORKSPACE</code> · <code>env.NODE_NAME</code> · <code>env.NODE_LABELS</code> · <code>env.EXECUTOR_NUMBER</code> · <code>env.BRANCH_NAME</code> · <code>env.CHANGE_ID</code> · <code>env.CHANGE_TARGET</code> · <code>env.STAGE_NAME</code> · <code>currentBuild.currentResult</code> · <code>currentBuild.changeSets</code> · <code>currentBuild.previousSuccessfulBuild</code> · <code>currentBuild.description</code>
+    </div>
+
+    <h3><span class="hn">24.7</span> Final checklist — you are ready when…</h3>
+    <ul class="check">
+      <li>You can write a full declarative Jenkinsfile from a blank file, without the Snippet Generator, except for exotic steps.</li>
+      <li>You can explain every stage of your pipeline and <em>why</em> it is there.</li>
+      <li>You have personally broken and fixed: a failing test, a failed quality gate, a CVE finding, a secret leak, a bad deploy, and a locked-out admin.</li>
+      <li>You can whiteboard the architecture: controller → labelled agents → registry → target server, with the security gates marked.</li>
+      <li>You can deliver the 60-second pitch without notes.</li>
+      <li>You can say "I don't know, but here's how I'd find out" — and mean it.</li>
+    </ul>
+
+    <div class="info"><span class="lbl"><span class="ic">🏁</span>Where to go next</span>
+    Once this is second nature, the natural next steps are: <strong>Kubernetes agents</strong> (ephemeral, auto-scaling), <strong>GitOps</strong> (ArgoCD pulling the image your Jenkins built), <strong>Terraform</strong> for the infrastructure, and <strong>GitHub Actions</strong> for contrast — knowing both makes you the person who chooses the right tool rather than the one who knows one tool.
+    </div>
+
+<h3><span class="hn">24.8</span> The whiteboard round — draw this</h3>
+<figure><pre class="ascii">
+ ┌──────────┐   push/PR   ┌──────────┐  webhook  ┌──────────────┐
+ │  GitHub  │────────────▶│ Jenkins  │◀──────────│ GitHub Branch│
+ │  branch  │             │controller│           │ Source       │
+ └──────────┘             └────┬─────┘           └──────────────┘
+                               │  Multibranch scans branches
+                               ▼
+                     ┌────────────────────┐
+                     │  Jenkinsfile       │  shared library @version
+                     │  checkout ─┐       │◀──── jenkins-shared-library
+                     └────────────┼───────┘
+                                  ▼
+   parallel ┌────────┬────────┬────────┬────────┐
+            │ build  │ lint   │  SCA   │ secrets│
+            └───┬────┴────┬───┴───┬────┴───┬────┘
+                ▼         ▼       ▼        ▼
+              test ──▶ Sonar ──▶ Quality Gate ──▶ docker build
+                                                       │
+                         ┌─────────────────────────────┘
+                         ▼
+              trivy scan ──▶ SBOM ──▶ push ──▶ deploy staging
+                                                       │
+                                                  input (approval)
+                                                       ▼
+                                        lock + milestone ──▶ deploy prod
+                                                       │
+                                                  post { always … }</pre>
+<figcaption>Figure 24.1 — The whole system on one screen. Practise drawing and narrating it in under three minutes.</figcaption></figure>
+<div class="tip"><span class="lbl"><span class="ic">💡</span>How to narrate it</span>
+"Developer pushes to a feature branch. GitHub Branch Source discovers it and the Multibranch job builds the Jenkinsfile from that branch — pipeline as code. Cheap stages run in parallel for fast feedback: build, lint, dependency scanning and secret scanning. Then tests with coverage, then SonarQube analysis with a quality gate that fails the build. On main we build a container, scan it, generate an SBOM, push an immutable tag to Docker Hub, deploy to staging behind an input gate, and finally deploy to production under a lock with milestones so concurrent builds can't interleave. Whatever happens, the post block publishes reports, notifies the team and cleans the workspace."</div>
+
+<h3><span class="hn">24.9</span> Troubleshooting cheat sheet</h3>
+<div class="tw"><table>
+<thead><tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Build hangs at checkout</td><td>SSH host key not trusted, or no credential bound</td><td>Add the host key to <span class="path">known_hosts</span>; verify the credential ID</td></tr>
+<tr><td><code>permission denied</code> on docker</td><td>jenkins user not in the <code>docker</code> group, or socket mounted without the group GID</td><td>Add the group, or pass <code>--group-add</code> with the host socket GID</td></tr>
+<tr><td>Quality gate times out</td><td>SonarQube webhook can't reach Jenkins</td><td>Check the webhook URL, firewall and certificate; raise the timeout</td></tr>
+<tr><td>Reports not published</td><td>Wrong path, or the stage ran on a different agent</td><td><code>findFiles</code> to confirm the path; stash before publishing</td></tr>
+<tr><td><code>NotSerializableException</code></td><td>A non-serializable object captured in pipeline state</td><td>Keep such objects local to <code>@NonCPS</code> methods or inside one <code>node</code></td></tr>
+<tr><td>Works locally, fails in CI</td><td>Different user, missing tool, or dirty workspace</td><td>Print <code>id</code>/<code>pwd</code>/<code>env</code>; run <code>cleanWs</code>; match the image</td></tr>
+<tr><td>Branch not discovered</td><td>Name filter, or no Jenkinsfile on that branch</td><td>Check the Scan Repository Log and branch filters</td></tr>
+<tr><td>Queue never drains</td><td>No agent matches the label</td><td><code>node('label')</code> vs configured labels; check agent online status</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">24.10</span> Salary-band mapping: what each level expects</h3>
+<div class="tw"><table>
+<thead><tr><th>Level (India, indicative)</th><th>They expect you to…</th></tr></thead>
+<tbody>
+<tr><td><strong>Junior (3–6 LPA)</strong></td><td>Install Jenkins, create freestyle and simple pipeline jobs, connect Git, run shell steps, read console output</td></tr>
+<tr><td><strong>Mid (6–12 LPA)</strong></td><td>Write declarative pipelines end to end, use credentials safely, agents and Docker, parallel stages, tests and reports, webhooks, shared libraries</td></tr>
+<tr><td><strong>Senior (12–20 LPA)</strong></td><td>Own the platform: RBAC, JCasC, HA/agents, DevSecOps gates, Kubernetes agents, performance, DR, mentoring, migrations</td></tr>
+<tr><td><strong>Lead / SRE (20 LPA+)</strong></td><td>Design multi-team CI architecture, cost and capacity planning, supply-chain security, self-service platforms, SLOs for CI</td></tr>
+</tbody>
+</table></div>
+<div class="info"><span class="lbl"><span class="ic">💡</span>Where this project puts you</span>
+What you built here — two stacks, a shared library, quality gates, SBOMs, image scanning, approvals, RBAC and JCasC — is comfortably mid-to-senior. The differentiator in interviews is not the tool list; it's being able to explain <em>why</em> each stage exists and what you'd do when it fails.</div>
+
+<h3><span class="hn">24.11</span> Thirty-day plan after this course</h3>
+<ol class="steps">
+<li><strong>Week 1 — Rebuild from scratch.</strong> Tear down your EC2 controller and rebuild it from your <span class="path">ec2-install.sh</span> + <span class="path">jenkins.yaml</span> + <span class="path">plugins.txt</span>. Time it.</li>
+<li><strong>Week 2 — Kubernetes agents.</strong> Add a k8s cloud (minikube is fine) and move the Node and Python builds to pod templates.</li>
+<li><strong>Week 3 — Real delivery.</strong> Deploy both apps to a real target (EC2 with compose, or a k8s cluster) with blue-green or rolling updates and automated rollback.</li>
+<li><strong>Week 4 — Prove it.</strong> Add synthetic monitoring post-deploy, publish a CI dashboard (build time, success rate, MTTR), and write two blog posts explaining a concept from this guide.</li>
+</ol>
+<div class="tip"><span class="lbl"><span class="ic">💡</span>The highest-leverage habit</span>
+Write up one Jenkins problem you hit and solved, every week, in public. Interviewers Google your name; a repo plus three clear write-ups beats any certification for demonstrating that you can operate the thing.</div>
+
+<h3><span class="hn">24.12</span> Final checklist before any Jenkins interview</h3>
+<ul class="check">
+<li>I can explain the difference between declarative and scripted pipeline, and when I'd choose each.</li>
+<li>I can write a full declarative pipeline from memory, including <code>agent</code>, <code>environment</code>, <code>options</code>, <code>stages</code>, <code>post</code>.</li>
+<li>I know how credentials are stored, injected and masked — and how masking can be defeated.</li>
+<li>I can explain CPS transformation, why variables must be serializable, and what <code>@NonCPS</code> is for.</li>
+<li>I know how a Multibranch scan works and what lightweight checkout implies.</li>
+<li>I can describe the agent model: labels, executors, SSH vs JNLP vs Docker vs Kubernetes.</li>
+<li>I can name each DevSecOps stage and justify its position in the pipeline.</li>
+<li>I can draw the whole delivery flow on a whiteboard and narrate it in under three minutes.</li>
+<li>I have a story for "tell me about a time CI broke in production and how you fixed it".</li>
+<li>I can say what I'd improve in <em>their</em> pipeline, and I have two questions ready for them.</li>
+</ul>
+<div class="box intv"><span class="lbl"><span class="ic">🎤</span>Closing advice</span>
+Depth beats breadth. An interviewer will happily trade ten tool names for one detailed, honest story about a pipeline you designed, a failure you diagnosed, and the trade-off you made. You now have both apps, the library, the gates and the operational runbook — talk about those, and the conversation will be about engineering rather than trivia. Good luck.</div>
+</section>

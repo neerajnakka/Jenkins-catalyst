@@ -1,0 +1,180 @@
+<section class="block" id="block-23" data-block="23" data-title="Troubleshooting playbook">
+    <div class="bhead"><div class="bnum">23</div><div>
+      <div class="bl">Block 23 · Operations &amp; interviews</div>
+      <h2>Troubleshooting playbook</h2>
+      <p class="bgoal"><b>Goal:</b> stop guessing. A repeatable debugging method plus a reference of the errors that actually happen — 90% of "Jenkins is broken" is one of these.</p>
+    </div></div>
+
+    <h3><span class="hn">23.1</span> The five-step debugging method</h3>
+    <ol class="steps">
+      <li><strong>Read the first error, not the last.</strong> Scroll the console log to the first <code>ERROR</code> or failing <code>+ command</code>. Java stack traces list 50 lines of context but the cause is usually in the first 5.</li>
+      <li><strong>Reproduce as the Jenkins user.</strong> <code>sudo -iu jenkins &lt;command&gt;</code>. If it fails there too, it's not a Jenkins problem — it's permissions, PATH, or the environment.</li>
+      <li><strong>Compare environments.</strong> Add <code>sh 'env | sort'</code>, <code>sh 'whoami &amp;&amp; pwd &amp;&amp; node -v'</code>. Differences in <code>PATH</code>, <code>HOME</code> and tool versions explain most "works locally" bugs.</li>
+      <li><strong>Isolate with Replay.</strong> Edit the Jenkinsfile in the browser, reduce it to just the failing step, iterate in seconds.</li>
+      <li><strong>Inspect the workspace.</strong> Job → Workspace. Are the files actually there? Did the checkout happen? Is a stale artifact breaking you? (Then <code>cleanWs()</code>.)</li>
+    </ol>
+
+    <h3><span class="hn">23.2</span> Diagnostic snippets to keep in your pocket</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Drop-in debug stage</span><button class="copy">📋 Copy</button></div><pre><code>stage('Debug') {
+    steps {
+        sh '''
+            set +e                     # keep going so we see everything
+            echo "--- identity ---";  whoami; id
+            echo "--- location ---";  pwd; ls -la
+            echo "--- tools ---";     node -v 2&gt;/dev/null; npm -v 2&gt;/dev/null
+                                      python3 -V 2&gt;/dev/null; docker -v 2&gt;/dev/null
+                                      git --version; java -version 2&gt;&amp;1 | head -1
+            echo "--- env ---";       env | sort
+            echo "--- disk ---";      df -h . ; du -sh . 2&gt;/dev/null
+            echo "--- network ---";   curl -sS -m 5 -o /dev/null -w "github:%{http_code}\\n" https://github.com
+                                      curl -sS -m 5 -o /dev/null -w "dockerhub:%{http_code}\\n" https://hub.docker.com
+        '''
+        echo "Jenkins env: BUILD=${env.BUILD_NUMBER} NODE=${env.NODE_NAME} LABELS=${env.NODE_LABELS}"
+        echo "Params: ${params}"
+        echo "Result so far: ${currentBuild.currentResult}"
+    }
+}</code></pre></div>
+
+    <h3><span class="hn">23.3</span> Error reference — agents &amp; execution</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Error / symptom</th><th>Root cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><code>Pending — waiting for next available executor</code></td><td>All executors busy, or no agent matches the label</td><td>Add executors/agents; check the label spelling matches <em>Nodes</em></td></tr>
+        <tr><td><code>No nodes with the label 'docker' found</code></td><td>Agent offline or mislabelled</td><td>Nodes → verify labels are space-separated and the agent is online</td></tr>
+        <tr><td><code>Required context class hudson.FilePath is missing</code></td><td>File step outside <code>steps</code>, or <code>post</code> with <code>agent none</code></td><td>Wrap in <code>steps { }</code> or <code>node('label') { }</code></td></tr>
+        <tr><td>Agent connects then disconnects repeatedly</td><td>Clock skew, disk full, Java crash</td><td>Check NTP, disk in the remote root dir, agent <code>journalctl</code></td></tr>
+        <tr><td><code>hudson.remoting.ChannelClosedException</code></td><td>Remoting channel died (OOM, network)</td><td>Raise agent heap, check network stability, look for OOM killer in <code>dmesg</code></td></tr>
+        <tr><td>Build hangs forever</td><td>No timeout, or a step waiting on stdin</td><td><code>options { timeout(...) }</code>; add <code>&lt; /dev/null</code> to interactive commands</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">23.4</span> Error reference — Git, Docker &amp; permissions</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Error</th><th>Root cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><code>Permission denied (publickey)</code></td><td>Public key absent on GitHub, or wrong key offered</td><td>Verify with <code>ssh -T git@github.com</code> as the jenkins user; re-add the deploy key</td></tr>
+        <tr><td><code>Host key verification failed</code></td><td>Host not in <span class="path">known_hosts</span></td><td><code>sudo -iu jenkins ssh-keyscan github.com &gt;&gt; ~/.ssh/known_hosts</code></td></tr>
+        <tr><td><code>Could not resolve credentialsId</code></td><td>Typo, or the credential is in a folder the job can't see</td><td>Copy the exact ID from Credentials; check folder scope</td></tr>
+        <tr><td><code>Cannot connect to the Docker daemon</code></td><td>jenkins not in docker group / daemon down</td><td><code>usermod -aG docker jenkins</code> + restart; <code>systemctl status docker</code></td></tr>
+        <tr><td><code>denied: requested access to the resource is denied</code></td><td>Wrong namespace or token lacks write scope</td><td>Match <code>DOCKER_USER</code> to your Docker Hub namespace; use an access token</td></tr>
+        <tr><td><code>permission denied while trying to connect to the Docker daemon socket</code></td><td>Socket owned by <code>root:docker</code></td><td>Add jenkins to the docker group and restart Jenkins (group loads at login)</td></tr>
+        <tr><td><code>no space left on device</code></td><td>Workspaces, images, build records</td><td><code>docker system prune -a</code>; <code>buildDiscarder</code>; <code>cleanWs()</code></td></tr>
+        <tr><td><code>Command not found</code> for a tool that exists</td><td><code>PATH</code> differs for the jenkins user</td><td>Use absolute paths, or <code>tools { }</code> / <code>withEnv</code></td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">23.5</span> Error reference — pipeline syntax &amp; plugins</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Error</th><th>Root cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><code>No such DSL method 'xxx' found among steps</code></td><td>Plugin missing, step outside <code>steps</code>, or a typo</td><td>Install the plugin; move the call inside <code>steps { }</code>; check spelling</td></tr>
+        <tr><td><code>Missing required parameter: "agent"</code></td><td><code>agent</code> declared with no value</td><td><code>agent any</code> / <code>agent none</code> / <code>agent { label '…' }</code></td></tr>
+        <tr><td><code>WorkflowScript: 12: expecting '}'</code></td><td>Unbalanced brace/comma earlier in the file</td><td>Read ~10 lines above; validate with the <code>pipeline-model-converter/validate</code> endpoint</td></tr>
+        <tr><td>Scripts not permitted to use method …</td><td>Groovy sandbox blocked a signature</td><td>Approve it in <em>In-process Script Approval</em>, or move the logic into a shared library</td></tr>
+        <tr><td>Variable prints literally as <code>${VAR}</code></td><td>Single quotes used</td><td>Double quotes for interpolation</td></tr>
+        <tr><td><code>Could not find or load main class</code> after upgrade</td><td>Java version mismatch</td><td>Install a supported JDK (17/21) and set <code>JAVA_HOME</code></td></tr>
+        <tr><td>Plugins fail to load after update</td><td>Dependency conflicts</td><td>Restore the backup, or update the dependency plugins first, one at a time</td></tr>
+        <tr><td><code>java.lang.OutOfMemoryError</code></td><td>Controller heap too small</td><td>Set <code>JAVA_OPTS=-Xmx2g</code> in <span class="path">/etc/default/jenkins</span>; reduce concurrent builds</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">23.6</span> Where to look — the log map</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Symptom</th><th>Log location</th></tr></thead>
+      <tbody>
+        <tr><td>Job failed</td><td>Job → Build → <strong>Console Output</strong></td></tr>
+        <tr><td>Controller won't start / crashes</td><td><code>journalctl -u jenkins -f</code> and <span class="path">/var/log/jenkins/jenkins.log</span></td></tr>
+        <tr><td>Webhook didn't trigger</td><td>GitHub → Webhooks → <em>Recent Deliveries</em>; then Jenkins log</td></tr>
+        <tr><td>Agent won't connect</td><td>Nodes → agent → <strong>Log</strong> (launch log)</td></tr>
+        <tr><td>Plugin misbehaving</td><td>Manage Jenkins → System Log → add a logger</td></tr>
+        <tr><td>SCM polling not detecting changes</td><td>Job → <strong>Git Polling Log</strong></td></tr>
+        <tr><td>Pipeline internals / Groovy errors</td><td>Console output + <em>Replay</em></td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">23.7</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>I have a reusable "Debug" stage I can paste into any pipeline.</li>
+      <li>I can name the first three things to check for any failing build.</li>
+      <li>I know where the controller log, the launch log and the polling log live.</li>
+      <li>I've deliberately reproduced at least three errors from the tables above and fixed them myself.</li>
+    </ul>
+
+    <h3><span class="hn">23.8</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>A build fails in Jenkins but works on my machine. Walk me through it.</div><div class="a">Reproduce as the Jenkins user with <code>sudo -iu jenkins</code> — that alone catches most of it. Then compare: tool versions, <code>PATH</code>, working directory, lockfile/commit status, network access to registries, and disk. Then read the first error in the console log rather than the last, and isolate the failing step with Replay.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>A build is stuck in the queue. Why?</div><div class="a">Either all executors are busy or no online agent matches the label expression. I check the queue's "why" text, then Nodes for offline agents and label spelling. Long term: more agents with those labels, and per-stage agents so a long stage doesn't hold a slot for the whole run.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>You see "Scripts not permitted to use method…". What do you do?</div><div class="a">It's the Groovy sandbox blocking a signature. For a one-off I approve it in <em>In-process Script Approval</em> after reviewing what it does — it grants that permission controller-wide. For anything recurring I move the logic into a shared library, where it runs outside the sandbox deliberately and is code-reviewed instead of click-approved.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>How do you diagnose a slow pipeline?</div><div class="a">Timestamper plus the Stage View shows exactly which stage is slow. From there: dependency download (add caching), Docker layer cache (<code>--cache-from</code>), sequential work that could be parallel, or an agent that's simply underpowered. I also check whether slowness correlates with concurrency — that's usually executors or I/O.</div></div>
+    </div>
+
+<h3><span class="hn">23.8</span> Under the hood — the plugin architecture</h3>
+<p>Every Jenkins feature you use is a plugin. Understanding four extension points explains most of what you see:</p>
+<div class="tw"><table>
+<thead><tr><th>Concept</th><th>What it is</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td><strong>Extension</strong></td><td>A class annotated <code>@Extension</code> that contributes behaviour to an extension point</td><td>A new build step, a new SCM, a new credential type</td></tr>
+<tr><td><strong>Describable</strong> + <code>Descriptor</code></td><td>A configurable object with metadata (display name, help, validation)</td><td>A step with a UI form in the Snippet Generator</td></tr>
+<tr><td><strong>Publisher / Recorder</strong></td><td>Runs in the <code>post</code> phase to consume build outputs</td><td><code>junit</code>, <code>archiveArtifacts</code>, <code>recordIssues</code></td></tr>
+<tr><td><strong>Builder / SimpleBuildStep</strong></td><td>Does work during the build</td><td><code>sh</code>, <code>docker build</code> steps</td></tr>
+</tbody>
+</table></div>
+<div class="info"><span class="lbl"><span class="ic">💡</span>Why this helps you in an interview</span>
+When someone says "we solved it with a custom plugin", being able to say "that would be a <code>SimpleBuildStep</code> with a <code>Descriptor</code>, or honestly a shared-library step if it's just orchestration" shows architectural judgement rather than tool ignorance.</div>
+
+<h3><span class="hn">23.9</span> The plugin selection checklist</h3>
+<div class="tw"><table>
+<thead><tr><th>Check</th><th>Where to look</th><th>Red flag</th></tr></thead>
+<tbody>
+<tr><td>Actively maintained</td><td>plugins.jenkins.io — last release date, changelog</td><td>No release in 2+ years</td></tr>
+<tr><td>Install base</td><td>Usage statistics on the plugin page</td><td>Very low, with no sponsor</td></tr>
+<tr><td>Open issues / security advisories</td><td>Jira, GitHub, Jenkins security advisories</td><td>Open unfixed advisory</td></tr>
+<tr><td>Compatibility</td><td>Required core version</td><td>Forces a core downgrade</td></tr>
+<tr><td>Overlap</td><td>Compare with what you already have</td><td>Three plugins doing the same job</td></tr>
+<tr><td>Exit cost</td><td>Can the logic live in the pipeline instead?</td><td>Config only exists in the plugin</td></tr>
+</tbody>
+</table></div>
+<div class="warn"><span class="lbl"><span class="ic">⚠️</span>Prefer pipeline code over plugins</span>
+Anything expressed in the Jenkinsfile is visible in code review, versioned with the app, and portable. Plugin configuration lives in the controller's XML. So: use plugins for capability (Kubernetes agents, SonarQube integration), but keep <em>policy</em> — thresholds, ordering, gating — in the pipeline.</div>
+
+<h3><span class="hn">23.10</span> Lab — install, audit, remove</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 23.1 · Plugin hygiene in practice</span>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Inventory and dependency audit</span><button class="copy">📋 Copy</button></div><pre><code># What is installed, with versions -- keep this in Git
+JENKINS_URL=http://localhost:8080
+curl -sS "$JENKINS_URL/pluginManager/api/json?depth=1" \
+  | jq -r '.plugins[] | "\(.shortName):\(.version)"' | sort &gt; plugins-installed.txt
+
+# Which plugins are pinned / have updates / are deprecated
+curl -sS "$JENKINS_URL/pluginManager/api/json?depth=1" \
+  | jq -r '.plugins[] | select(.hasUpdate or .pinned or .deleted)
+           | "\(.shortName) update=\(.hasUpdate) pinned=\(.pinned) deleted=\(.deleted)"'
+
+# Who depends on a plugin you want to remove? (dependency graph)
+curl -sS "$JENKINS_URL/pluginManager/api/json?depth=2" \
+  | jq -r '.plugins[] | select(.shortName=="credentials") | .dependencies[] | .shortName'</code></pre></div>
+Then: uninstall one plugin you added early but no longer use, restart, and confirm nothing breaks. <em>Always</em> check the dependency list first — removing a shared dependency can disable several others at once.</div>
+
+<h3><span class="hn">23.11</span> Your curated plugin set by block</h3>
+<div class="tw"><table>
+<thead><tr><th>Category</th><th>Plugins</th></tr></thead>
+<tbody>
+<tr><td><strong>Essential</strong></td><td>Pipeline, Git, Credentials, Credentials Binding, SSH Agent, Blue Ocean (optional)</td></tr>
+<tr><td><strong>SCM &amp; Multibranch</strong></td><td>GitHub Branch Source, GitHub, Git Parameter, SCM API</td></tr>
+<tr><td><strong>Reporting</strong></td><td>JUnit, Coverage, HTML Publisher, Warnings NG, Test Results Analyzer</td></tr>
+<tr><td><strong>Quality</strong></td><td>SonarQube Scanner, JaCoCo, TestNG</td></tr>
+<tr><td><strong>Agents &amp; Cloud</strong></td><td>SSH Build Agents, Docker, Docker Pipeline, Kubernetes</td></tr>
+<tr><td><strong>Operations</strong></td><td>Configuration as Code, Job DSL, ThinBackup, Monitoring, Prometheus metrics</td></tr>
+<tr><td><strong>Security</strong></td><td>Role-based Authorization Strategy, Matrix Authorization, Mask Passwords, OWASP Dependency-Check</td></tr>
+<tr><td><strong>UX</strong></td><td>Blue Ocean, Pipeline Stage View, Timestamper, AnsiColor, Build Monitor View</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">23.12</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>How do you manage plugin risk?</div><div class="a">Keep the installed set minimal and pinned, record it in Git (or a plugins.txt used to build the image), subscribe to Jenkins security advisories, and test upgrades on a staging controller. Every plugin is code running with controller privileges, so the set is an attack surface, not a feature list.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>A plugin breaks after an upgrade. What now?</div><div class="a">Identify the culprit from the update history, roll back that plugin (keep the previous <span class="path">.jpi</span>), or restore the controller from the pre-upgrade snapshot. If it's a longer fix, check whether the functionality can move into the pipeline or a shared library so the dependency disappears.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>Configuration as Code vs Job DSL vs manual setup?</div><div class="a">JCasC configures the controller (security realm, agents, tools, credentials) from YAML at boot. Job DSL creates <em>jobs</em> from Groovy seed scripts. Manual setup is for exploration only. In a mature setup everything is one of the first two, and Multibranch plus Jenkinsfiles means most job definitions live in Git anyway.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>How do you introduce a new plugin to a team?</div><div class="a">Add it in a staging controller, prove the value in one pipeline, document the integration steps, then promote it to the shared plugin list with a pinned version — and tell the team what it replaces. Never install directly on production first.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q10</span>When would you write your own plugin?</div><div class="a">Only when the behaviour genuinely cannot be expressed in a pipeline or shared library — deep integration with an internal system, a new credential type, or a custom UI. Otherwise a shared-library step is cheaper to write, test and review, and it's portable.</div></div>
+</div>
+</section>

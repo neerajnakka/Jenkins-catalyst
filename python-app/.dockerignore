@@ -1,0 +1,14 @@
+__pycache__
+*.pyc
+.pytest_cache
+venv
+.venv
+htmlcov
+coverage.xml
+reports
+.git
+.gitignore
+Dockerfile
+.dockerignore
+Jenkinsfile
+sonar-project.properties

@@ -1,0 +1,323 @@
+<section class="block" id="block-4" data-block="4" data-title="Git + GitHub integration">
+    <div class="bhead"><div class="bnum">04</div><div>
+      <div class="bl">Block 4 · Foundation</div>
+      <h2>Git + GitHub integration</h2>
+      <p class="bgoal"><b>Goal:</b> Jenkins pulls your code from GitHub automatically, authenticated, without a human typing a password — the single most fundamental CI capability.</p>
+    </div></div>
+
+    <h3><span class="hn">4.1</span> Two ways to authenticate (learn both)</h3>
+    <div class="grid2">
+      <div class="card"><h5>🔑 SSH key <span class="pill p-rec">Preferred for servers</span></h5><p>A key pair. Private key lives in the Jenkins credentials store; public key is registered on GitHub. No expiry, no scope juggling, works for deploy keys too.</p></div>
+      <div class="card"><h5>🎟️ HTTPS + Personal Access Token</h5><p>Uses a GitHub PAT as the password. Easy to rotate, easy to revoke, and required for the GitHub API (Block 15 multibranch, PR status).</p></div>
+    </div>
+
+    <h3><span class="hn">4.2</span> Option A — SSH key (recommended)</h3>
+    <ol class="steps">
+      <li><strong>Generate the key as the jenkins user</strong> — not as root, or the file permissions will be wrong and ssh will silently refuse to use it.</li>
+    </ol>
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">On the EC2 box — as the jenkins user</span><button class="copy">📋 Copy</button></div><pre><code>sudo -iu jenkins bash                       # become the jenkins user
+mkdir -p ~/.ssh &amp;&amp; chmod 700 ~/.ssh
+ssh-keygen -t ed25519 -C "jenkins@ci" -f ~/.ssh/id_ed25519 -N ""   # no passphrase
+cat ~/.ssh/id_ed25519.pub                   # 1) copy this to GitHub
+
+# 2) TRUST github.com's host key -- without this the first checkout hangs or fails
+ssh-keyscan -t rsa,ed25519 github.com >> ~/.ssh/known_hosts
+chmod 600 ~/.ssh/known_hosts
+
+# 3) prove it before touching Jenkins (fail here = fail in the pipeline)
+ssh -T git@github.com                       # -&gt; "Hi &lt;you&gt;! You've successfully authenticated"
+cat ~/.ssh/id_ed25519                       # 4) copy this PRIVATE key into Jenkins</code></pre></div>
+
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">ui</span><span class="fn">Register the key in both places</span><button class="copy">📋 Copy</button></div><pre><code>GITHUB  (public key)
+  Repo → Settings → Deploy keys → Add deploy key    (read-only, per repo)   - preferred
+  or: GitHub → Settings → SSH and GPG keys → New SSH key   (all your repos)
+
+JENKINS (private key)
+  Manage Jenkins → Credentials → System → Global credentials → Add Credentials
+    Kind         : SSH Username with private key
+    ID           : github-ssh            &lt;-- you will reference this exact string
+    Username     : git
+    Private Key  : Enter directly → paste the whole -----BEGIN ... KEY----- block
+                   (include the BEGIN and END lines)</code></pre></div>
+
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>Deploy key vs account key</span>
+    A <strong>deploy key</strong> is scoped to one repository and can be read-only — perfect for a CI that only clones. An <strong>account key</strong> grants access to every repo you can see. In interviews, "we used per-repo read-only deploy keys" is the stronger answer.</div>
+
+    <h3><span class="hn">4.3</span> Option B — HTTPS with a Personal Access Token</h3>
+    <ol class="steps">
+      <li>GitHub → <em>Settings → Developer settings → Personal access tokens → Tokens (classic)</em> → <strong>Generate new token</strong>. Scopes: <code>repo</code> (private repos) and <code>admin:repo_hook</code> if you want Jenkins to create the webhook for you (Block 10).</li>
+      <li>Jenkins → <em>Credentials → System → Global → Add Credentials</em> → Kind: <strong>Username with password</strong> → Username: your GitHub username → Password: <strong>the token</strong> → ID: <code>github-pat</code>.</li>
+    </ol>
+    <div class="dang"><span class="lbl"><span class="ic">🚨</span>Never put a token in the Jenkinsfile</span>
+    A PAT in a Jenkinsfile is a credential committed to Git, visible in every fork, clone and CI log. Tokens go in the <strong>credentials store</strong> and are referenced by <strong>ID</strong>. We cover injection in Block 8.</div>
+
+    <h3><span class="hn">4.4</span> The checkout step</h3>
+    <div class="tabs">
+      <div class="tabbar">
+        <button class="tab on" data-t="a">checkout scmGit (modern)</button>
+        <button class="tab" data-t="b">git step (classic)</button>
+        <button class="tab" data-t="c">checkout scm (job-configured)</button>
+      </div>
+      <div class="tabpane on" data-t="a">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Generated by the Snippet Generator → "checkout: Check out from version control"</span><button class="copy">📋 Copy</button></div><pre><code>checkout scmGit(
+    branches: [[name: '*/main']],
+    extensions: [
+        cleanBeforeCheckout(),                       // wipe workspace before cloning
+        [$class: 'CloneOption', shallow: true, depth: 1, noTags: false],
+        [$class: 'SubmoduleOption', recursiveSubmodules: true]
+    ],
+    userRemoteConfigs: [[
+        credentialsId: 'github-ssh',
+        url: 'git@github.com:&lt;you&gt;/jenkins-zero-to-hero.git'
+    ]]
+)</code></pre></div>
+      </div>
+      <div class="tabpane" data-t="b">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Simple, readable, enough for most repos</span><button class="copy">📋 Copy</button></div><pre><code>git branch: 'main',
+    url: 'git@github.com:&lt;you&gt;/jenkins-zero-to-hero.git',
+    credentialsId: 'github-ssh'</code></pre></div>
+      </div>
+      <div class="tabpane" data-t="c">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Inherits whatever the job's SCM config says (essential for Multibranch, Block 15)</span><button class="copy">📋 Copy</button></div><pre><code>// Reads the SCM + branch from the job configuration.
+// In a Multibranch Pipeline, `scm` is the branch being built --
+// so you MUST use this form there, never hard-code `main`.
+checkout scm
+
+// ...and to control it (skip the automatic checkout, do it yourself):
+options { skipDefaultCheckout(true) }
+stages {
+    stage('Checkout') {
+        steps { checkout scm }
+    }
+}</code></pre></div>
+      </div>
+    </div>
+
+    <div class="tw"><table>
+      <thead><tr><th>Extension</th><th>Why you'd use it</th></tr></thead>
+      <tbody>
+        <tr><td><code>cleanBeforeCheckout()</code></td><td>Delete stale files before cloning. Prevents "it works on my machine" from leftover artifacts.</td></tr>
+        <tr><td><code>[$class:'CloneOption', shallow:true, depth:1]</code></td><td>Shallow clone — much faster on big repos. Not for pipelines that need full history/tags.</td></tr>
+        <tr><td><code>[$class:'SparseCheckoutPaths']</code></td><td>Clone only <code>nodejs-app/**</code> in a monorepo.</td></tr>
+        <tr><td><code>[$class:'LocalBranch']</code></td><td>Check out a real local branch instead of detached HEAD (needed if you push tags back).</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">4.5</span> Useful Git facts inside a pipeline</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Read commit metadata for image tags and reports</span><button class="copy">📋 Copy</button></div><pre><code>script {
+    env.GIT_COMMIT_SHORT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+    env.GIT_BRANCH_NAME  = sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
+    env.GIT_AUTHOR       = sh(script: "git log -1 --pretty=format:'%an'", returnStdout: true).trim()
+    env.GIT_MESSAGE      = sh(script: "git log -1 --pretty=format:'%s'", returnStdout: true).trim()
+    echo "Building ${env.GIT_COMMIT_SHORT} on ${env.GIT_BRANCH_NAME} by ${env.GIT_AUTHOR}"
+}</code></pre></div>
+
+    <h3><span class="hn">4.6</span> ✍️ Jenkinsfiles v4 — real checkout</h3>
+    <div class="tabs">
+      <div class="tabbar">
+        <button class="tab on" data-t="n4">🟩 nodejs-app/Jenkinsfile</button>
+        <button class="tab" data-t="p4">🐍 python-app/Jenkinsfile</button>
+      </div>
+      <div class="tabpane on" data-t="n4">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">nodejs-app/Jenkinsfile — v4</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+    options { timestamps(); timeout(time: 20, unit: 'MINUTES') }
+
+    environment {
+        APP_NAME  = 'nodejs-app'
+        REPO_URL  = 'git@github.com:&lt;you&gt;/jenkins-zero-to-hero.git'
+        GIT_CRED  = 'github-ssh'          // credential ID from Manage Jenkins
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                dir(APP_NAME) {                       // keep each app in its own folder
+                    checkout scmGit(
+                        branches: [[name: '*/main']],
+                        extensions: [cleanBeforeCheckout()],
+                        userRemoteConfigs: [[credentialsId: env.GIT_CRED, url: env.REPO_URL]]
+                    )
+                }
+                script {
+                    dir(APP_NAME) {
+                        env.GIT_SHA = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    }
+                    echo "Checked out ${env.GIT_SHA}"
+                }
+            }
+        }
+        stage('Build') { steps { echo 'Block 5' } }
+        stage('Test')  { steps { echo 'Block 6' } }
+    }
+
+    post { always { echo "Result: ${currentBuild.currentResult}" } }
+}</code></pre></div>
+      </div>
+      <div class="tabpane" data-t="p4">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">python-app/Jenkinsfile — v4</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+    options { timestamps(); timeout(time: 20, unit: 'MINUTES') }
+
+    environment {
+        APP_NAME  = 'python-app'
+        REPO_URL  = 'git@github.com:&lt;you&gt;/jenkins-zero-to-hero.git'
+        GIT_CRED  = 'github-ssh'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                dir(APP_NAME) {
+                    checkout scmGit(
+                        branches: [[name: '*/main']],
+                        extensions: [cleanBeforeCheckout()],
+                        userRemoteConfigs: [[credentialsId: env.GIT_CRED, url: env.REPO_URL]]
+                    )
+                }
+                script {
+                    dir(APP_NAME) {
+                        env.GIT_SHA = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    }
+                    echo "Checked out ${env.GIT_SHA}"
+                }
+            }
+        }
+        stage('Build') { steps { echo 'Block 5' } }
+        stage('Test')  { steps { echo 'Block 6' } }
+    }
+
+    post { always { echo "Result: ${currentBuild.currentResult}" } }
+}</code></pre></div>
+      </div>
+    </div>
+    <div class="note"><span class="lbl"><span class="ic">📌</span>From Block 15 onward</span>
+    Hard-coding the URL and branch is fine now, but Multibranch jobs inject the right branch automatically — that's when we switch to <code>checkout scm</code>. Both apps' final Jenkinsfiles use that form.</div>
+
+    <h3><span class="hn">4.7</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li><code>ssh -T git@github.com</code> succeeds when run as the jenkins user.</li>
+      <li>Credential <code>github-ssh</code> exists in Jenkins with ID spelled exactly as in the Jenkinsfile.</li>
+      <li>Both pipelines show a green <strong>Checkout</strong> stage that prints a commit SHA.</li>
+      <li>You know what changes when a branch is renamed (the <code>branches</code> value).</li>
+    </ul>
+
+    <h3><span class="hn">4.8</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>How does Jenkins authenticate to a private Git repo?</div><div class="a">With a credential stored in the Jenkins credentials store and referenced by ID. Typically an SSH private key whose public half is registered as a GitHub deploy key, or a PAT over HTTPS. The private key never appears in the Jenkinsfile — only the credential ID does.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span><code>checkout scm</code> vs <code>git ...</code> — when do you use which?</div><div class="a"><code>checkout scm</code> inherits the SCM and branch from the job configuration, so it's mandatory in Multibranch pipelines where the branch varies per build. An explicit <code>git</code>/<code>checkout scmGit</code> step is used when the pipeline must control URL, branch or clone extensions itself.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>Why use a shallow clone?</div><div class="a"><code>depth: 1</code> downloads only the latest commit, cutting clone time and disk on large repos. The trade-off is no history or tags, so it's unsuitable for pipelines that compute version numbers from history or push tags.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>How do you stop Jenkins from auto-checking out twice?</div><div class="a"><code>options { skipDefaultCheckout(true) }</code> disables the implicit checkout, then I run <code>checkout scm</code> explicitly inside a stage — which gives control over ordering, extensions and workspace layout.</div></div>
+    </div>
+
+    <h3><span class="hn">4.9</span> 🔥 Common errors</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Error</th><th>Cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><code>Host key verification failed</code></td><td>github.com not in jenkins user's <span class="path">known_hosts</span></td><td><code>sudo -iu jenkins ssh-keyscan github.com &gt;&gt; ~/.ssh/known_hosts</code></td></tr>
+        <tr><td><code>Permission denied (publickey)</code></td><td>Public key not on GitHub, or private key missing BEGIN/END lines</td><td>Re-copy <code>id_ed25519.pub</code> to GitHub; paste the full private key into the credential</td></tr>
+        <tr><td><code>Could not resolve credentialsId</code></td><td>Typo in the ID string</td><td>Credentials are matched by exact ID — copy it from the credentials list</td></tr>
+        <tr><td><code>WARNING: UNPROTECTED PRIVATE KEY FILE</code></td><td>Key file permissions too open</td><td><code>chmod 600 ~/.ssh/id_ed25519</code> as the jenkins user</td></tr>
+        <tr><td>Clone works as root but not in Jenkins</td><td>Key lives in <span class="path">/root/.ssh</span></td><td>Jenkins runs as <code>jenkins</code>; its keys must be in <span class="path">/var/lib/jenkins/.ssh</span></td></tr>
+      </tbody>
+    </table></div>
+
+<h3><span class="hn">4.10</span> Under the hood — what "checkout" really does</h3>
+<p>The Git plugin keeps a real <span class="path">.git</span> directory in the workspace: it fetches, checks out the ref, and optionally cleans. Three details that matter in practice:</p>
+<div class="tw"><table>
+<thead><tr><th>Concept</th><th>What it means</th><th>Why you care</th></tr></thead>
+<tbody>
+<tr><td><strong>Branch specifier</strong></td><td><code>*/main</code> means "the <code>main</code> branch of any remote". Multibranch resolves <code>*/&lt;branch&gt;</code> per build.</td><td>A wrong specifier gives a silent "no changes".</td></tr>
+<tr><td><strong>Lightweight checkout</strong></td><td>Multibranch reads the Jenkinsfile straight from the Git API, before allocating a workspace, to decide if a branch is buildable.</td><td>Fast indexing — and why a Jenkinsfile syntax error appears at scan time.</td></tr>
+<tr><td><strong>Changelog</strong></td><td>Jenkins computes the commit range since the last successful build into <code>currentBuild.changeSets</code>.</td><td>This is how you notify the person who broke it.</td></tr>
+</tbody>
+</table></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Extracting authors, messages and changed files</span><button class="copy">📋 Copy</button></div><pre><code>script {
+    def changes = currentBuild.changeSets.collectMany { cs -&gt;
+        cs.items.collect { c -&gt;
+            [ author: c.author.fullName,
+              email : c.author.getProperty(hudson.tasks.Mailer.UserProperty)?.address,
+              msg   : c.msg.take(120),
+              files : c.affectedFiles.collect { f -&gt; f.path } ]
+        }
+    }
+    echo "This build contains ${changes.size()} commit(s)"
+    changes.each { c -&gt; echo "- ${c.author}: ${c.msg}" }
+    env.CULPRIT_EMAILS = changes.collect { it.email }.findAll { it }.unique().join(',')
+}</code></pre></div>
+
+<h3><span class="hn">4.11</span> Choosing an authentication method</h3>
+<div class="tw"><table>
+<thead><tr><th>Situation</th><th>Use</th><th>Reason</th></tr></thead>
+<tbody>
+<tr><td>CI clones one repo, read-only</td><td><strong>SSH deploy key</strong> (read-only)</td><td>Smallest blast radius — cannot push even if leaked</td></tr>
+<tr><td>CI clones many repos</td><td>SSH key on a machine account, or a PAT</td><td>One credential to rotate</td></tr>
+<tr><td>Multibranch / Branch Source</td><td><strong>PAT</strong> with <code>repo</code> + <code>admin:repo_hook</code></td><td>Branch discovery uses the REST API, not git</td></tr>
+<tr><td>GitHub App available</td><td><strong>GitHub App</strong> credentials</td><td>Short-lived tokens, granular permissions — best at scale</td></tr>
+<tr><td>Pipeline pushes tags back</td><td>Deploy key with write access, or PAT</td><td>Read-only keys are rejected</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">4.12</span> Lab — break the key, then repair it</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 4.1 · The three failure modes of Git over SSH</span>
+<strong>A. Wrong permissions.</strong>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Reproduce then fix</span><button class="copy">📋 Copy</button></div><pre><code>sudo -iu jenkins chmod 644 ~/.ssh/id_ed25519     # break it
+sudo -iu jenkins ssh -T git@github.com           # "UNPROTECTED PRIVATE KEY FILE"
+sudo -iu jenkins chmod 600 ~/.ssh/id_ed25519     # fix it</code></pre></div>
+<strong>B. Unknown host.</strong>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Reproduce then fix</span><button class="copy">📋 Copy</button></div><pre><code>sudo -iu jenkins mv ~/.ssh/known_hosts /tmp/kh   # break it
+sudo -iu jenkins ssh -T git@github.com           # "Host key verification failed"
+sudo -iu jenkins ssh-keyscan -t rsa,ed25519 github.com &gt;&gt; ~/.ssh/known_hosts</code></pre></div>
+<strong>C. Credential ID mismatch.</strong> Rename the Jenkins credential to <code>github-ssh-typo</code> and re-run: you get <code>Could not resolve credentialsId</code>. This proves credentials are matched by exact string, not by fuzzy name.</div>
+
+<h3><span class="hn">4.13</span> Monorepo patterns</h3>
+<p>Our repo holds two apps. Three ways to avoid building both on every commit:</p>
+<div class="tabs">
+  <div class="tabbar">
+    <button class="tab on" data-t="m1">A. Sparse checkout</button>
+    <button class="tab" data-t="m2">B. Change detection</button>
+    <button class="tab" data-t="m3">C. Two jobs, two paths</button>
+  </div>
+  <div class="tabpane on" data-t="m1">
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Clone only the folder you need</span><button class="copy">📋 Copy</button></div><pre><code>checkout scmGit(
+    branches: [[name: '*/main']],
+    extensions: [[$class: 'SparseCheckoutPaths',
+                  sparseCheckoutPaths: [[path: 'nodejs-app/']]]],
+    userRemoteConfigs: [[credentialsId: 'github-ssh', url: env.REPO_URL]]
+)</code></pre></div>
+  </div>
+  <div class="tabpane" data-t="m2">
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Skip the build when your folder didn't change</span><button class="copy">📋 Copy</button></div><pre><code>stage('Change detection') {
+    agent { label 'linux' }
+    steps {
+        script {
+            checkout scm
+            def files = sh(script: 'git diff --name-only HEAD~1 HEAD', returnStdout: true).trim()
+            env.CHANGED = files.readLines().any { it.startsWith('nodejs-app/') } ? 'true' : 'false'
+            echo "nodejs-app changed: ${env.CHANGED}"
+        }
+    }
+}
+stage('Test') {
+    when { expression { env.CHANGED == 'true' } }
+    steps { dir('nodejs-app') { sh 'npm ci &amp;&amp; npm test' } }
+}</code></pre></div>
+    <p style="font-size:14.5px">Caveat: <code>HEAD~1</code> misses multi-commit pushes. Prefer <code>git diff --name-only ${env.GIT_PREVIOUS_SUCCESSFUL_COMMIT} HEAD</code> when that variable is set.</p>
+  </div>
+  <div class="tabpane" data-t="m3">
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Simplest: one Multibranch job per app</span><button class="copy">📋 Copy</button></div><pre><code># Job: nodejs-pipeline  -> Script Path: nodejs-app/Jenkinsfile
+# Job: python-pipeline  -> Script Path: python-app/Jenkinsfile
+#
+# Each job still clones the repo (cheap for us) but executes only its own
+# Jenkinsfile, so only that app is built, tested, scanned and pushed.</code></pre></div>
+  </div>
+</div>
+
+<h3><span class="hn">4.14</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q5</span>How does Jenkins know who broke the build?</div><div class="a">It computes the changelog between the last successful build and the current one and exposes it as <code>currentBuild.changeSets</code>, from which I read author, message and affected paths — that drives targeted notifications.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q6</span>Submodules, LFS and sparse checkouts?</div><div class="a">All three are checkout <em>extensions</em>: <code>[$class:'SubmoduleOption', recursiveSubmodules:true]</code>, Git LFS via the LFS pull extension, and <code>SparseCheckoutPaths</code> for monorepos. I generate them rather than hand-write the class names.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>Why would a branch not appear in a Multibranch scan?</div><div class="a">Branch discovery disabled, the name filtered out by the include/exclude regex, no Jenkinsfile at the configured path, or the PAT lacks <code>repo</code> scope. The <em>Scan Repository Log</em> states which one it hit.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>How do you avoid building every app on every commit in a monorepo?</div><div class="a">Sparse-checkout the relevant path, or compute changed paths from the changelog and gate stages with <code>when</code>. At larger scale, per-app jobs with path filters, or an orchestrator that fans out only to affected components.</div></div>
+</div>
+</section>

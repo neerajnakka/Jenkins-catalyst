@@ -1,0 +1,186 @@
+<section class="block" id="block-12" data-block="12" data-title="RBAC, users &amp; permissions">
+    <div class="bhead"><div class="bnum">12</div><div>
+      <div class="bl">Block 12 · Real engineering</div>
+      <h2>RBAC, users &amp; permissions</h2>
+      <p class="bgoal"><b>Goal:</b> turn "anyone can do anything" into least privilege: the right people can do the right things, and nobody can read production secrets. This is the block that separates an admin from a user.</p>
+    </div></div>
+
+    <h3><span class="hn">12.1</span> Authentication vs Authorization</h3>
+    <div class="grid2">
+      <div class="card"><h5>🔐 Security Realm <em>(authentication)</em></h5><p><strong>Who are you?</strong> Jenkins' own user database, LDAP/Active Directory, GitHub OAuth, SAML, SSO.</p></div>
+      <div class="card"><h5>🛂 Authorization Strategy <em>(authorization)</em></h5><p><strong>What may you do?</strong> Matrix-based, Project-based Matrix, or Role-Based Strategy.</p></div>
+    </div>
+    <p>Find both under <em>Manage Jenkins → Security</em>.</p>
+
+    <h3><span class="hn">12.2</span> Why Role-Based beats Matrix at scale</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Strategy</th><th>How it works</th><th>Problem</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Anyone can do anything</strong></td><td>No restrictions</td><td>Never acceptable beyond a laptop</td></tr>
+        <tr><td><strong>Logged-in users can do anything</strong></td><td>One checkbox per permission</td><td>Every user is effectively admin</td></tr>
+        <tr><td><strong>Matrix-based security</strong></td><td>A grid of users × ~50 permissions</td><td>Edit 20 users' grids individually — unmaintainable</td></tr>
+        <tr><td><strong>Project-based Matrix</strong></td><td>Matrix per job</td><td>Better, but still per-job editing</td></tr>
+        <tr><td><strong>Role-Based Strategy</strong> ⭐</td><td>Define <em>roles</em>, assign users to roles</td><td>Needs the plugin — and is what real companies use</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">12.3</span> Setting up Role-Based Authorization Strategy</h3>
+    <ol class="steps">
+      <li>Install the plugin: <strong>Role-based Authorization Strategy</strong> (<code>role-strategy</code>).</li>
+      <li><em>Manage Jenkins → Security → Authorization</em> → select <strong>Role-Based Strategy</strong> → Save.</li>
+      <li><em>Manage Jenkins → Security → Manage and Assign Roles</em> appears. Configure three role types:</li>
+    </ol>
+
+    <div class="tw"><table>
+      <thead><tr><th>Role type</th><th>Controls</th><th>Examples</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Global roles</strong></td><td>Controller-wide powers</td><td><code>admin</code> (Overall/Administer) · <code>readonly</code> (Overall/Read) · <code>developer</code> (Overall/Read + Job/Read)</td></tr>
+        <tr><td><strong>Item roles</strong></td><td>Jobs, by name <em>pattern</em></td><td><code>nodejs-team</code> → pattern <code>nodejs-.*</code> with Build/Cancel/Configure · <code>python-team</code> → <code>python-.*</code></td></tr>
+        <tr><td><strong>Agent roles</strong></td><td>Which agents a role may use</td><td><code>can-use-linux</code> → pattern <code>linux-.*</code></td></tr>
+      </tbody>
+    </table></div>
+
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">ui</span><span class="fn">A sensible three-role setup for this project</span><button class="copy">📋 Copy</button></div><pre><code>Manage Roles
+  GLOBAL
+    admin       : Overall → Administer, Read · Credentials → Create/Delete/ManageDomains
+                  (keep this to 1-2 people!)
+    developer   : Overall → Read · Job → Read · View → Read
+    readonly    : Overall → Read
+
+  ITEM
+    nodejs-team : Pattern  nodejs-.*   → Job: Build, Cancel, Read, Workspace, Configure
+    python-team : Pattern  python-.*   → Job: Build, Cancel, Read, Workspace, Configure
+    viewer      : Pattern  .*          → Job: Read
+
+  AGENT
+    linux-users : Pattern  linux-.*    → Agent: Build, Connect
+
+Assign Roles
+  you          → admin, nodejs-team, python-team
+  teammate-a   → developer, nodejs-team
+  teammate-b   → developer, python-team
+  intern       → readonly, viewer</code></pre></div>
+
+    <div class="tip"><span class="lbl"><span class="ic">💡</span>Item patterns are regex, and they're your whole security model</span>
+    <code>nodejs-.*</code> matches every job whose name starts with <code>nodejs-</code>. Combine that with <strong>Folders</strong> (New Item → Folder) and you get per-team namespaces where credentials can also be scoped — a team literally cannot see another team's secrets.</div>
+
+    <h3><span class="hn">12.4</span> The hardening checklist</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Setting</th><th>Where</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Disable anonymous read</td><td>Security → Authorization</td><td>Otherwise anyone on the network sees job names, logs and repo URLs</td></tr>
+        <tr><td>Enable CSRF protection</td><td>Security → CSRF Protection (default on)</td><td>Stops cross-site request forgery against build endpoints</td></tr>
+        <tr><td>Agent → Controller Access Control</td><td>Security → Agents</td><td>Stops a compromised agent reading credentials or calling controller APIs</td></tr>
+        <tr><td>Use API tokens, not passwords</td><td>User → Security → API Token</td><td>Revocable, scoped, and not your account password</td></tr>
+        <tr><td>Script Approval review</td><td>Security → In-process Script Approval</td><td>Review every Groovy signature a pipeline wants to call</td></tr>
+        <tr><td>HTTPS via reverse proxy</td><td>Nginx + Let's Encrypt</td><td>Never send Jenkins credentials over plain HTTP</td></tr>
+        <tr><td>Audit trail</td><td>Plugins: <em>Audit Trail</em>, <em>Job Config History</em></td><td>Who changed what, and when — required in regulated teams</td></tr>
+      </tbody>
+    </table></div>
+
+    <div class="dang"><span class="lbl"><span class="ic">🚨</span>Locked yourself out? Recovery</span>
+    If you enable Role-Based Strategy and remove your own admin rights, Jenkins will not let you back in through the UI. Recovery (needs server access):
+    <div class="code" data-lang="bash" style="margin:10px 0 0"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Emergency admin recovery</span><button class="copy">📋 Copy</button></div><pre><code># 1. Stop Jenkins
+sudo systemctl stop jenkins
+
+# 2. Edit the global config: disable authorization entirely
+sudo vim /var/lib/jenkins/config.xml
+#    &lt;useSecurity&gt;true&lt;/useSecurity&gt;   ->   &lt;useSecurity&gt;false&lt;/useSecurity&gt;
+#    (also remove the &lt;authorizationStrategy&gt; block if you like)
+
+# 3. Start, log in as admin, re-configure roles properly, re-enable security
+sudo systemctl start jenkins</code></pre></div>
+    Always keep a second admin account. This is the #1 self-inflicted Jenkins outage.</div>
+
+    <h3><span class="hn">12.5</span> RBAC in the real world — the story to tell</h3>
+    <div class="info"><span class="lbl"><span class="ic">🎤</span>How to describe it in an interview</span>
+    "Controllers used the Role-Based Authorization Strategy plugin. We had a global <code>readonly</code> role for everyone, a <code>developer</code> role with build and workspace access, and item roles scoped by folder pattern so the Node team could only configure <code>nodejs-*</code> jobs. Credentials were stored in folder domains, so a team physically couldn't use another team's secrets. Anonymous access was off, agents had restricted controller access, and every admin action was captured in an audit trail."
+    </div>
+
+    <h3><span class="hn">12.6</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>Role-Strategy plugin installed and active.</li>
+      <li>Created <code>readonly</code>, <code>developer</code> and <code>admin</code> global roles.</li>
+      <li>Created two item roles with regex patterns and tested them with a second user account.</li>
+      <li>Anonymous read is off; you can prove it in a private/incognito window.</li>
+      <li>You know the <span class="path">config.xml</span> lockout recovery procedure.</li>
+    </ul>
+
+    <h3><span class="hn">12.7</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>How do you implement RBAC in Jenkins?</div><div class="a">With the Role-based Authorization Strategy plugin: global roles for controller-wide permissions, item roles scoped by job-name pattern or folder, and agent roles restricting which agents a user's builds may run on. Users are assigned to roles, and I follow least privilege — most people get read + build, a few get configure, and admin is limited to one or two people.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>How do you stop one team seeing another team's credentials?</div><div class="a">Put each team's jobs in a folder, store their credentials in that folder's credentials domain, and grant the team's item role only on that folder pattern. Credentials outside the folder are neither visible nor referenceable by their pipelines.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>What did you lock down on a production controller?</div><div class="a">Anonymous access off, CSRF on, agent→controller access control on, HTTPS via a reverse proxy, admins limited to a named few, API tokens instead of passwords, and an audit-trail plugin so configuration changes are attributable.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>You're locked out of Jenkins after a permissions change. What now?</div><div class="a">I have server access, so I stop Jenkins, set <code>&lt;useSecurity&gt;false&lt;/useSecurity&gt;</code> in <span class="path">/var/lib/jenkins/config.xml</span>, restart, log back in as admin, fix the roles, and re-enable security. To prevent it happening I always keep a second admin account and test role changes with a non-admin user first.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q5</span>What's the difference between authentication and authorization here?</div><div class="a">Authentication (the security realm) decides who you are — local database, LDAP, GitHub OAuth. Authorization (the strategy) decides what you may do — matrix or role-based permissions. They're configured independently in Manage Jenkins → Security.</div></div>
+    </div>
+
+<h3><span class="hn">12.8</span> Under the hood — how authorization is evaluated</h3>
+<p>Jenkins asks, for every action, "does this user hold permission X on item Y?" The <code>AuthorizationStrategy</code> answers using the <strong>ACL</strong> attached to the item. With Role Strategy, item roles contribute ACL entries matched by job-name regex, which is why folder structure is a security control, not just tidiness.</p>
+<div class="tw"><table>
+<thead><tr><th>Concept</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><strong>Permission</strong></td><td>An atomic capability: <code>Job/Build</code>, <code>Job/Configure</code>, <code>Credentials/Create</code>, <code>Overall/Administer</code>, <code>Run/Delete</code></td></tr>
+<tr><td><strong>Role</strong></td><td>A named bundle of permissions (global / item / agent)</td></tr>
+<tr><td><strong>Assignment</strong></td><td>User or group → role. Groups come from the security realm (LDAP, GitHub orgs, SAML)</td></tr>
+<tr><td><strong>Item pattern</strong></td><td>Regex over the full item name, e.g. <code>nodejs-.*</code> or <code>team-a/.*</code> for folders</td></tr>
+<tr><td><strong>Folder</strong></td><td>A namespace that scopes both item roles and credentials</td></tr>
+</tbody>
+</table></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Script Console — audit who has what</span><button class="copy">📋 Copy</button></div><pre><code>import com.michelin.cio.hudson.plugins.rolestrategy.*
+import jenkins.model.Jenkins
+
+def strategy = Jenkins.instance.getAuthorizationStrategy()
+if (strategy instanceof RoleBasedAuthorizationStrategy) {
+    strategy.getRoleMaps().each { type, map -&gt;
+        println "=== ${type} ==="
+        map.getRoles().each { role -&gt;
+            println "  ${role.name}  pattern=${role.pattern}"
+            println "    perms : ${role.permissions.collect { it.name }.join(', ')}"
+            println "    users : ${map.getAssignedSIDs(role.name).join(', ')}"
+        }
+    }
+}</code></pre></div>
+
+<h3><span class="hn">12.9</span> A complete hardening runbook</h3>
+<ol class="steps">
+  <li><strong>Enable security</strong> with a real realm (local DB for labs, LDAP/OIDC/SAML in companies).</li>
+  <li><strong>Set Role-Based Strategy</strong>; create <code>readonly</code>, <code>developer</code>, <code>admin</code> global roles.</li>
+  <li><strong>Create folders per team</strong> and item roles scoped to <code>&lt;folder&gt;/.*</code>.</li>
+  <li><strong>Move credentials into folder domains</strong>; delete the global duplicates.</li>
+  <li><strong>Turn off anonymous access</strong>; verify in a private window.</li>
+  <li><strong>Enable Agent → Controller Access Control</strong> so agents can't read credentials or call controller APIs.</li>
+  <li><strong>Put HTTPS in front</strong>; bind 8080 to localhost.</li>
+  <li><strong>Issue API tokens</strong> for automation; never embed account passwords.</li>
+  <li><strong>Install an audit trail</strong> (Audit Trail + Job Config History).</li>
+  <li><strong>Keep a second admin account</strong> so one mistake can't lock you out.</li>
+</ol>
+<div class="warn"><span class="lbl"><span class="ic">⚠️</span>The one that surprises people</span>
+<code>Overall/Read</code> is required for almost anything to be visible at all — including for the <code>github-webhook/</code> endpoint to work when using authenticated triggers. Grant it to a dedicated <code>ci-trigger</code> service account rather than to <code>anonymous</code>.</div>
+
+<h3><span class="hn">12.10</span> Lab — verify your RBAC like an attacker</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 12.1 · Test with a second account</span>
+Create user <code>intern</code> with only <code>readonly</code>, then log in as them (private window) and confirm:
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">What an unprivileged user must NOT be able to do</span><button class="copy">📋 Copy</button></div><pre><code># 1. Anonymous sees nothing
+curl -s -o /dev/null -w "anon: %{http_code}\n" http://&lt;jenkins&gt;:8080/
+
+# 2. A read-only user cannot build
+curl -s -o /dev/null -w "intern build: %{http_code}\n" \
+     -u intern:pass -X POST http://&lt;jenkins&gt;:8080/job/nodejs-app/build
+
+# 3. A read-only user cannot read credentials
+curl -s -o /dev/null -w "intern creds: %{http_code}\n" \
+     -u intern:pass http://&lt;jenkins&gt;:8080/credentials/store/system/domain/_/api/json
+
+# Expected: 403 (or 401) on 1-3, never 200</code></pre></div>
+Then in the UI confirm the intern can see <code>nodejs-app</code> but cannot click <em>Build Now</em>, and cannot see the Script Console.</div>
+
+<h3><span class="hn">12.11</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>How do you integrate Jenkins with LDAP or SSO?</div><div class="a">Change the <em>Security Realm</em>: LDAP plugin with a server URL, bind DN and user search base, or SAML/OIDC plugins for SSO. Authentication then delegates to the directory while authorization stays role-based, with groups from the directory mapped to Jenkins roles.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>What is Agent → Controller Access Control?</div><div class="a">A security subsystem that restricts what an agent process can ask the controller to do — for example reading credentials or calling remoting APIs. Without it, anyone who can run a build on an agent effectively has controller-level access, which is a serious risk in shared environments.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>How do you give a contractor temporary access?</div><div class="a">Create a named account, assign the least-privilege role on the specific folder, and set a calendar reminder or an expiry process to remove it. I never share accounts, and I review the user list quarterly.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>How do you prove compliance (who changed what)?</div><div class="a">The Audit Trail plugin records authentication and configuration events, and Job Config History keeps every version of every job configuration — so I can show who changed a pipeline definition and when, which is what auditors ask for.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q10</span>Jenkins is fully open on a new install. What do you do on day one?</div><div class="a">Run the setup wizard with my own admin account (never the default), disable anonymous access, enable role-based authorization, create folders and scoped credentials, enable agent→controller access control, and put it behind HTTPS.</div></div>
+</div>
+</section>

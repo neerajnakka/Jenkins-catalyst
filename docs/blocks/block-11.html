@@ -1,0 +1,319 @@
+<section class="block" id="block-11" data-block="11" data-title="post{} mastery">
+    <div class="bhead"><div class="bnum">11</div><div>
+      <div class="bl">Block 11 · Real engineering</div>
+      <h2><code>post{}</code> mastery — cleanup, artifacts &amp; signals</h2>
+      <p class="bgoal"><b>Goal:</b> make every build finish responsibly: reports published, artifacts kept, workspaces cleaned, and the right people told the right thing.</p>
+    </div></div>
+
+    <h3><span class="hn">11.1</span> Every condition, and the order they run in</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Order</th><th>Condition</th><th>Fires when</th><th>Put here</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>always</code></td><td>Every run</td><td>Publish tests &amp; coverage, record results</td></tr>
+        <tr><td>2</td><td><code>changed</code></td><td>Result differs from the previous build</td><td>"Status changed" notices</td></tr>
+        <tr><td>3</td><td><code>aborted</code></td><td>Cancelled (manual or timeout)</td><td>Release locks/resources</td></tr>
+        <tr><td>4</td><td><code>regression</code></td><td>Was succeeding, now failing</td><td>Escalate: "you broke main"</td></tr>
+        <tr><td>5</td><td><code>fixed</code></td><td>Was failing, now succeeding</td><td>Close the incident, celebrate</td></tr>
+        <tr><td>6</td><td><code>success</code> / <code>failure</code> / <code>unstable</code> / <code>unsuccessful</code></td><td>Result-specific</td><td>Notifications, tagging, rollbacks</td></tr>
+        <tr><td>7</td><td><code>cleanup</code></td><td><strong>Always, and last</strong></td><td>Delete temp files, stop containers, prune images</td></tr>
+      </tbody>
+    </table></div>
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>Two things beginners get wrong</span>
+    <ul style="margin:0;padding-left:20px">
+      <li><strong>All matching conditions run</strong> — they are not <code>else if</code>. A green build runs <code>always</code> <em>and</em> <code>success</code>.</li>
+      <li><strong><code>cleanup</code> runs after everything</strong>, even if a step inside <code>always</code> throws. Anything that must not be skipped goes there.</li>
+    </ul></div>
+
+    <h3><span class="hn">11.2</span> <code>post</code> at stage level too</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Per-stage post — surgical reactions</span><button class="copy">📋 Copy</button></div><pre><code>stage('Container Smoke Test') {
+    steps { script { app.inside('-p 3100:3000') { sh 'curl -fsS localhost:3100/health' } } }
+    post {
+        failure {
+            // only this stage failed -> give the on-call engineer the container logs
+            sh 'docker logs $(docker ps -lq) || true'
+            archiveArtifacts artifacts: 'container.log', allowEmptyArchive: true
+        }
+    }
+}</code></pre></div>
+
+    <h3><span class="hn">11.3</span> The <code>currentBuild</code> object</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Everything useful about "this build"</span><button class="copy">📋 Copy</button></div><pre><code>post {
+    always {
+        script {
+            echo "result        : ${currentBuild.currentResult}"   // SUCCESS / FAILURE / UNSTABLE / ABORTED
+            echo "final result  : ${currentBuild.result}"          // null until set
+            echo "duration      : ${currentBuild.durationString}"
+            echo "url           : ${currentBuild.absoluteUrl}"
+            echo "previous      : ${currentBuild.previousBuild?.result}"
+            echo "changed files : ${currentBuild.changeSets}"      // who broke it, and which files
+
+            // make the build history readable at a glance
+            currentBuild.description = "${params.ENV ?: 'dev'} · ${env.GIT_SHA}"
+            currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.GIT_SHA}"
+        }
+    }
+    failure {
+        script {
+            def culprits = currentBuild.changeSets.collectMany { it.items.collect { it.author.fullName } }.unique()
+            echo "Notify: ${culprits.join(', ')}"
+        }
+    }
+}</code></pre></div>
+
+    <h3><span class="hn">11.4</span> Workspace cleanup — the disk discipline</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Three levels of tidiness</span><button class="copy">📋 Copy</button></div><pre><code>post {
+    cleanup {
+        // 1. Fast: wipe the workspace (requires the Workspace Cleanup plugin)
+        cleanWs()
+
+        // 2. Targeted: keep the workspace, remove the heavy stuff
+        // deleteDir()                        // nuke everything
+        // sh 'rm -rf nodejs-app/venv'        // just the venv
+
+        // 3. Reclaim Docker disk (the biggest offender on a CI box)
+        sh '''
+            docker image prune -f || true
+            docker container prune -f || true
+            docker builder prune -f || true
+        '''
+    }
+}</code></pre></div>
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>Never <code>cleanWs()</code> while debugging</span>
+    A wiped workspace destroys the evidence you need. Clean up only once the pipeline is stable — or use the <code>patterns</code> option to keep logs: <code>cleanWs(patterns: [[pattern: '**/*.log', type: 'INCLUDE']])</code>.</div>
+
+    <h3><span class="hn">11.5</span> Failing loudly, but correctly</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Result control patterns</span><button class="copy">📋 Copy</button></div><pre><code>// A. Keep going, but remember that something went wrong
+catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+    sh 'npm run lint'
+}
+
+// B. Retry a flaky network step, then give up properly
+retry(3) { sh 'docker pull node:20-alpine' }
+
+// C. Retry with a growing delay (needs a script block)
+script {
+    def attempts = 3
+    for (int i = 1; i &lt;= attempts; i++) {
+        try { sh 'curl -fsS https://registry.npmjs.org/'; break }
+        catch (err) {
+            if (i == attempts) { error "Registry unreachable after ${attempts} attempts" }
+            sleep(time: i * 5, unit: 'SECONDS')
+        }
+    }
+}
+
+// D. Soft-fail a stage but keep the pipeline green (use with care!)
+warnError('Lint found issues') { sh 'npm run lint' }   // Pipeline: Basic Steps 2.290+</code></pre></div>
+
+    <h3><span class="hn">11.6</span> ✍️ Jenkinsfiles v11 — the professional <code>post</code></h3>
+    <div class="tabs">
+      <div class="tabbar">
+        <button class="tab on" data-t="n11">🟩 nodejs-app/Jenkinsfile</button>
+        <button class="tab" data-t="p11">🐍 python-app/Jenkinsfile</button>
+      </div>
+      <div class="tabpane on" data-t="n11">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">nodejs-app/Jenkinsfile — v11 (post block)</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+    options {
+        timestamps(); timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '5'))
+        disableConcurrentBuilds()
+    }
+    environment { APP_NAME = 'nodejs-app'; IMAGE = '&lt;user&gt;/nodejs-app' }
+
+    stages {
+        stage('Checkout') { /* ...as before... */ }
+        stage('Build')    { steps { dir(APP_NAME) { sh 'npm ci' } } }
+        stage('Test')     { steps { dir(APP_NAME) { sh 'npm run test:junit' } } }
+        stage('Docker Build') { steps { dir(APP_NAME) { script { app = docker.build("${IMAGE}:${env.GIT_SHA}", '--pull .') } } } }
+        stage('Push') {
+            when { branch 'main' }
+            steps { script { docker.withRegistry('https://index.docker.io/v1/','dockerhub-creds') { app.push(env.GIT_SHA) } } }
+        }
+    }
+
+    post {
+        always {
+            script {
+                // readable build history
+                currentBuild.description = "${env.GIT_SHA ?: 'unknown'}"
+            }
+            dir(APP_NAME) {
+                junit testResults: 'reports/junit.xml', allowEmptyResults: true
+                recordCoverage tools: [[parser: 'COBERTURA', pattern: 'coverage/cobertura-coverage.xml']],
+                               sourceCodeRetention: 'LAST_BUILD'
+            }
+            archiveArtifacts artifacts: '**/reports/**,**/coverage/**', allowEmptyArchive: true
+        }
+        success  { echo "✅ ${APP_NAME} ${env.GIT_SHA} built and pushed" }
+        unstable { echo "⚠️  Built, but quality gates were not met: ${env.BUILD_URL}" }
+        failure  {
+            script {
+                def culprits = currentBuild.changeSets
+                        .collectMany { it.items.collect { it.author.fullName } }.unique()
+                echo "❌ FAILED — last commit by: ${culprits.join(', ') ?: 'unknown'}"
+            }
+        }
+        fixed    { echo "🎉 Back to green after a failure" }
+        regression { echo "🔥 Regression: this used to pass — investigate ${env.BUILD_URL}" }
+        cleanup {
+            sh 'docker image prune -f || true'
+            cleanWs()
+        }
+    }
+}</code></pre></div>
+      </div>
+      <div class="tabpane" data-t="p11">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">python-app/Jenkinsfile — v11 (post block)</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+    options {
+        timestamps(); timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '5'))
+        disableConcurrentBuilds()
+    }
+    environment { APP_NAME = 'python-app'; IMAGE = '&lt;user&gt;/python-app' }
+
+    stages {
+        stage('Checkout') { /* ...as before... */ }
+        stage('Build')    { steps { dir(APP_NAME) { sh '''
+                    python3 -m venv venv; . venv/bin/activate
+                    pip install -r requirements-dev.txt
+                ''' } } }
+        stage('Test')     { steps { dir(APP_NAME) { sh '. venv/bin/activate &amp;&amp; pytest --cov-fail-under=70' } } }
+        stage('Docker Build') { steps { dir(APP_NAME) { script { app = docker.build("${IMAGE}:${env.GIT_SHA}", '--pull .') } } } }
+        stage('Push') {
+            when { branch 'main' }
+            steps { script { docker.withRegistry('https://index.docker.io/v1/','dockerhub-creds') { app.push(env.GIT_SHA) } } }
+        }
+    }
+
+    post {
+        always {
+            script { currentBuild.description = "${env.GIT_SHA ?: 'unknown'}" }
+            dir(APP_NAME) {
+                junit testResults: 'reports/junit.xml', allowEmptyResults: true
+                recordCoverage tools: [[parser: 'COBERTURA', pattern: 'coverage.xml']],
+                               sourceCodeRetention: 'LAST_BUILD'
+            }
+            archiveArtifacts artifacts: '**/reports/**,**/htmlcov/**', allowEmptyArchive: true
+        }
+        success  { echo "✅ ${APP_NAME} ${env.GIT_SHA} built and pushed" }
+        unstable { echo "⚠️  Built, but quality gates were not met: ${env.BUILD_URL}" }
+        failure  {
+            script {
+                def culprits = currentBuild.changeSets
+                        .collectMany { it.items.collect { it.author.fullName } }.unique()
+                echo "❌ FAILED — last commit by: ${culprits.join(', ') ?: 'unknown'}"
+            }
+        }
+        fixed    { echo "🎉 Back to green after a failure" }
+        regression { echo "🔥 Regression: this used to pass — investigate ${env.BUILD_URL}" }
+        cleanup {
+            sh 'rm -rf python-app/venv || true'
+            sh 'docker image prune -f || true'
+            cleanWs()
+        }
+    }
+}</code></pre></div>
+      </div>
+    </div>
+
+    <h3><span class="hn">11.7</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>I forced a failure and saw <code>always</code>, <code>failure</code> and <code>cleanup</code> all run in the right order.</li>
+      <li>Build history shows a readable description with the commit SHA.</li>
+      <li>Artifacts (JUnit XML, coverage) are downloadable from the build page.</li>
+      <li>Disk usage stopped growing between builds (cleanup works).</li>
+    </ul>
+
+    <h3><span class="hn">11.8</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>What goes in <code>always</code> vs <code>cleanup</code>?</div><div class="a"><code>always</code> for things that are part of the result — publishing test reports, coverage and artifacts. <code>cleanup</code> for things that must happen no matter what, including if <code>always</code> itself throws: deleting temp files, stopping containers, pruning images. <code>cleanup</code> always runs last.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>How do you notify only when a build breaks — and only the person who broke it?</div><div class="a">In <code>post { failure { } }</code> I read <code>currentBuild.changeSets</code> to extract the commit authors of this build, then message them (Slack DM or email). I use <code>regression</code> for "main was green, now it's broken" and <code>fixed</code> to close the loop.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>How do you stop a stage failing the whole pipeline?</div><div class="a"><code>catchError(buildResult:'UNSTABLE', stageResult:'FAILURE')</code> — the stage is marked red, the build is marked unstable, and the pipeline continues. I use it for advisory checks (lint, optional scans), never for tests that guard a release.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>How do you stop Jenkins running out of disk?</div><div class="a">Three layers: <code>buildDiscarder(logRotator(...))</code> to cap build history, <code>cleanWs()</code> in <code>post { cleanup }</code> for workspaces, and regular <code>docker image/container/builder prune</code> — Docker layers are usually the biggest consumer on a CI machine.</div></div>
+    </div>
+
+<h3><span class="hn">11.9</span> Under the hood — build results in detail</h3>
+<div class="tw"><table>
+<thead><tr><th>Result</th><th>Set by</th><th>Subsequent stages</th><th>Typical action</th></tr></thead>
+<tbody>
+<tr><td><code>SUCCESS</code></td><td>Nothing failed</td><td>Run</td><td>Deploy / notify green</td></tr>
+<tr><td><code>UNSTABLE</code></td><td><code>junit</code> failures, quality gate, <code>catchError</code>, <code>unstable()</code></td><td>Run (unless <code>skipStagesAfterUnstable()</code>)</td><td>Warn, don't page</td></tr>
+<tr><td><code>FAILURE</code></td><td>Non-zero <code>sh</code> exit, <code>error()</code>, exception</td><td>Skipped</td><td>Alert the author</td></tr>
+<tr><td><code>ABORTED</code></td><td>User cancel, <code>timeout</code>, declined input</td><td>Skipped</td><td>Release resources</td></tr>
+<tr><td><code>NOT_BUILT</code></td><td>Stage skipped by <code>when</code></td><td>—</td><td>None</td></tr>
+</tbody>
+</table></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Reading and setting results deliberately</span><button class="copy">📋 Copy</button></div><pre><code>post {
+    always {
+        script {
+            echo "currentResult   : ${currentBuild.currentResult}"   // live value
+            echo "result          : ${currentBuild.result}"          // final value (null if unset)
+            echo "durationString  : ${currentBuild.durationString}"
+            echo "previous result : ${currentBuild.previousBuild?.result}"
+            echo "build url       : ${currentBuild.absoluteUrl}"
+
+            // Per-stage results (useful for a summary table in notifications)
+            def stages = currentBuild.rawBuild.getExecution().getStages()
+                          .collect { "${it.getName()}: ${it.getStatus()}" }
+            echo stages.join('
+')
+        }
+    }
+}</code></pre></div>
+
+<h3><span class="hn">11.10</span> Lab — the ordering experiment</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 11.1 · Prove the post order yourself</span>
+Run this on a pipeline both ways (success and forced failure) and read the console carefully.
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Which conditions fire, and in what order?</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+    parameters { booleanParam name: 'FAIL', defaultValue: false }
+    stages {
+        stage('work') {
+            steps {
+                script { if (params.FAIL) { error 'deliberate failure' } else { echo 'ok' } }
+            }
+        }
+    }
+    post {
+        always      { echo 'ORDER 1: always' }
+        changed     { echo 'ORDER 2: changed' }
+        aborted     { echo 'ORDER 3: aborted' }
+        regression  { echo 'ORDER 4: regression' }
+        fixed       { echo 'ORDER 5: fixed' }
+        success     { echo 'ORDER 6: success' }
+        failure     { echo 'ORDER 6: failure' }
+        unstable    { echo 'ORDER 6: unstable' }
+        cleanup     { echo 'ORDER 7: cleanup (always last)' }
+    }
+}</code></pre></div>
+Run it green, then with <code>FAIL=true</code> (regression), then green again (<code>fixed</code>). You now have first-hand evidence for the ordering table.</div>
+
+<h3><span class="hn">11.11</span> Notification payload design</h3>
+<div class="info"><span class="lbl"><span class="ic">💡</span>Every alert should answer five questions</span>
+<strong>What</strong> broke · <strong>Which</strong> commit/branch · <strong>Who</strong> is responsible · <strong>Where</strong> to look (deep link) · <strong>What to do</strong> next. If a message can't answer all five, people will ignore it.
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">A well-formed failure message</span><button class="copy">📋 Copy</button></div><pre><code>post {
+    failure {
+        script {
+            def c = currentBuild.changeSets.collectMany { it.items }.take(3)
+            def who = c.collect { it.author.fullName }.unique().join(', ') ?: 'unknown'
+            slackSend(channel: '#ci', color: 'danger', message: """
+                :x: *${env.JOB_NAME}* #${env.BUILD_NUMBER} FAILED
+                • Branch : ${env.BRANCH_NAME ?: 'n/a'}  • Commit: ${env.GIT_SHA ?: 'n/a'}
+                • Stage  : ${env.STAGE_NAME}
+                • Author : ${who}
+                • &lt;${env.BUILD_URL}|Console log&gt;  • &lt;${env.BUILD_URL}console|Full output&gt;
+            """.stripIndent().trim())
+        }
+    }
+}</code></pre></div></div>
+
+<h3><span class="hn">11.12</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q5</span>How do you make sure a cleanup step always runs?</div><div class="a">Put it in <code>post { cleanup { } }</code>, which runs after every other post condition — including if a step inside <code>always</code> throws. If the pipeline uses <code>agent none</code>, wrap it in <code>node('label') { }</code> so it has somewhere to execute.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q6</span>How do you attach build artifacts to a failure notification?</div><div class="a"><code>archiveArtifacts</code> in <code>post { always }</code>, then link <code>${env.BUILD_URL}artifact/</code> in the message, or use <code>emailext attachLog: true</code> to include the console output. Deep links matter more than attachments — nobody downloads a file to find out what happened.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>What should never be in a <code>post</code> block?</div><div class="a">Anything that can fail the build for a non-build reason. Notification and cleanup steps must be wrapped so that a Slack outage or a missing file can't turn a green build red.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>How do you record who approved or who broke a build for audits?</div><div class="a">Capture the approver with <code>submitterParameter</code> on <code>input</code> and store it in <code>currentBuild.description</code>; derive the culprit from <code>currentBuild.changeSets</code>. Both end up in the build record, which I retain for the audit window with <code>buildDiscarder</code>.</div></div>
+</div>
+</section>

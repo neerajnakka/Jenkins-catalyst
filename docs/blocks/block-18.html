@@ -1,0 +1,395 @@
+<section class="block" id="block-18" data-block="18" data-title="DevSecOps · container &amp; DAST">
+    <div class="bhead"><div class="bnum">18</div><div>
+      <div class="bl">Block 18 · DevSecOps &amp; scale</div>
+      <h2>DevSecOps part 3 — image scanning, SBOM, signing &amp; DAST</h2>
+      <p class="bgoal"><b>Goal:</b> scan what you actually ship (the image), prove what's inside it (SBOM), sign it, and attack the running app (DAST). This completes the DevSecOps story end to end.</p>
+    </div></div>
+
+    <h3><span class="hn">18.1</span> The full pipeline picture</h3>
+    <figure><pre class="ascii">
+  ┌──────────┐   ┌──────────┐   ┌───────────┐   ┌────────────┐   ┌──────────┐   ┌────────┐
+  │ CHECKOUT │──▶│  BUILD   │──▶│   TEST    │──▶│  SAST/SCA  │──▶│  IMAGE   │──▶│  DAST  │
+  │   scm    │   │ npm/venv │   │ jest/pyt  │   │ sonar/triv │   │ trivy/sbom│  │  ZAP   │
+  └──────────┘   └──────────┘   └───────────┘   │ gitleaks   │   │  cosign  │   └────────┘
+                                                 └────────────┘   └────┬─────┘
+                                                                        │
+                                                ┌───────────┐   ┌──────▼──────┐
+                                                │  NOTIFY   │◀──│   DEPLOY    │
+                                                │  slack    │   │ compose/ssh │
+                                                └───────────┘   └─────────────┘
+        ▲ shift LEFT: cheap, fast, per commit          ▲ shift RIGHT: what you actually ship</pre>
+    <figcaption>Figure 18.1 — Where each security gate sits. Left = static, cheap, every commit. Right = the real artifact and the running system.</figcaption></figure>
+
+    <h3><span class="hn">18.2</span> Scanning the image (Trivy)</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Image vulnerability gate</span><button class="copy">📋 Copy</button></div><pre><code>stage('Scan image · Trivy') {
+    agent { label 'docker' }
+    steps {
+        script {
+            // 1. Always produce a readable report (never blocks)
+            sh """
+                trivy image --format table --output trivy-image.txt \
+                            --severity HIGH,CRITICAL ${IMAGE}:${env.GIT_SHA} || true
+            """
+
+            // 2. Blocking gate: fail on high/critical that HAVE a fix available
+            sh """
+                trivy image --exit-code 1 \
+                            --severity HIGH,CRITICAL \
+                            --ignore-unfixed \
+                            ${IMAGE}:${env.GIT_SHA}
+            """
+
+            // 3. Also fail on any misconfiguration in the Dockerfile
+            sh "trivy config --exit-code 1 --severity HIGH,CRITICAL ${CONTEXT} || true"
+        }
+    }
+    post {
+        always {
+            archiveArtifacts artifacts: 'trivy-image.txt', allowEmptyArchive: true
+        }
+    }
+}</code></pre></div>
+    <div class="tw"><table>
+      <thead><tr><th>Flag</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>--ignore-unfixed</code></td><td>Don't fail on CVEs with no fix released yet — otherwise your pipeline is permanently red for things you cannot fix</td></tr>
+        <tr><td><code>--severity HIGH,CRITICAL</code></td><td>Start strict on the top two; add MEDIUM once the noise is manageable</td></tr>
+        <tr><td><code>--exit-code 1</code></td><td>Turn the scan into a gate</td></tr>
+        <tr><td><code>trivy config</code></td><td>Scans Dockerfiles and IaC (Kubernetes YAML, Terraform) for misconfigurations</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">18.3</span> SBOM — prove what's inside</h3>
+    <p>An SBOM (Software Bill of Materials) is a machine-readable inventory of everything in your image. When the next Log4Shell happens, you answer "are we affected?" in seconds instead of days.</p>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Generate + attach an SBOM (Syft / CycloneDX)</span><button class="copy">📋 Copy</button></div><pre><code>stage('SBOM') {
+    agent { label 'docker' }
+    steps {
+        sh """
+            syft ${IMAGE}:${env.GIT_SHA} -o cyclonedx-json=sbom.cdx.json
+            # or, with Trivy alone:
+            trivy image --format cyclonedx --output sbom.cdx.json ${IMAGE}:${env.GIT_SHA}
+        """
+        archiveArtifacts artifacts: 'sbom.cdx.json', fingerprint: true
+    }
+}
+
+stage('Sign image · cosign') {
+    agent { label 'docker' }
+    when { branch 'main' }
+    steps {
+        withCredentials([file(credentialsId: 'cosign-key', variable: 'COSIGN_KEY')]) {
+            sh '''
+                export COSIGN_PASSWORD=""
+                cosign sign --key $COSIGN_KEY ${IMAGE}:${GIT_SHA}
+            '''
+        }
+    }
+}</code></pre></div>
+    <div class="info"><span class="lbl"><span class="ic">🔐</span>Verify on the other side</span>
+    Signing only matters if someone checks it. In Kubernetes: <strong>Kyverno</strong> or <strong>Sigstore policy-controller</strong> rejects any pod whose image isn't signed by your key. On a plain VM: <code>cosign verify --key cosign.pub &lt;image&gt;</code> before <code>docker run</code>.</div>
+
+    <h3><span class="hn">18.4</span> DAST — attack the running app (OWASP ZAP)</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">ZAP baseline scan against the container we just built</span><button class="copy">📋 Copy</button></div><pre><code>stage('DAST · OWASP ZAP baseline') {
+    agent { label 'docker' }
+    steps {
+        script {
+            // 1. Run the app in a throwaway container
+            sh "docker run -d --name app-${env.BUILD_NUMBER} -p 8099:3000 ${IMAGE}:${env.GIT_SHA}"
+
+            // 2. Wait for it to be ready
+            retry(10) { sleep 3; sh 'curl -fsS http://localhost:8099/health || exit 1' }
+
+            // 3. Attack it with ZAP (docker image, no install needed)
+            sh """
+                mkdir -p zap-reports &amp;&amp; chmod 777 zap-reports
+                docker run --rm --network host \
+                  -v \$(pwd)/zap-reports:/zap/wrk:rw \
+                  ghcr.io/zaproxy/zaproxy:stable \
+                  zap-baseline.py -t http://localhost:8099 \
+                                  -g gen.conf \
+                                  -r zap-report.html \
+                                  -w zap-report.md \
+                                  -J zap-report.json || true
+            """
+        }
+    }
+    post {
+        always {
+            sh "docker rm -f app-${env.BUILD_NUMBER} || true"
+            archiveArtifacts artifacts: 'zap-reports/**', allowEmptyArchive: true
+        }
+    }
+}</code></pre></div>
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>Start with <code>zap-baseline.py</code>, not the full scan</span>
+    The baseline scan is passive and takes ~1 minute — safe for every commit. A full active scan (<code>zap-full-scan.py</code>) can take 30+ minutes and can be destructive; run it nightly against a staging environment, never against production.</div>
+
+    <h3><span class="hn">18.5</span> Should security stages block the build?</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Scan</th><th>Timing</th><th>Gate</th></tr></thead>
+      <tbody>
+        <tr><td>Secrets (gitleaks)</td><td>Every commit</td><td>🔴 Block always</td></tr>
+        <tr><td>SAST quality gate (new code)</td><td>Every commit</td><td>🔴 Block</td></tr>
+        <tr><td>SCA high/critical with fix</td><td>Every commit</td><td>🔴 Block</td></tr>
+        <tr><td>Image scan high/critical fixable</td><td>Every build</td><td>🔴 Block before push</td></tr>
+        <tr><td>Image scan, unfixed / medium</td><td>Every build</td><td>🟡 Report</td></tr>
+        <tr><td>ZAP baseline</td><td>Every commit</td><td>🟡 Report (block later)</td></tr>
+        <tr><td>ZAP full scan</td><td>Nightly</td><td>🟡 Report to security team</td></tr>
+        <tr><td>Lint / style</td><td>Every commit</td><td>🟡 Unstable at most</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">18.6</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>Trivy image scan runs and blocks on fixable HIGH/CRITICAL.</li>
+      <li>An SBOM (<span class="path">sbom.cdx.json</span>) is generated and archived per build.</li>
+      <li>ZAP baseline produces a report against the running container.</li>
+      <li>I know which scans block and which only report — and why.</li>
+    </ul>
+
+    <h3><span class="hn">18.7</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>Walk me through your DevSecOps pipeline.</div><div class="a">Source stage: SonarQube SAST with a quality gate on new code. Dependency stage: npm audit / pip-audit plus Trivy filesystem and gitleaks for secrets. Build stage: multi-stage image, non-root, then Trivy image scan gating on fixable high/critical, an SBOM with Syft, and cosign signing on <code>main</code>. Runtime stage: the container is started, smoke-tested, and scanned with the OWASP ZAP baseline. Reports are archived and trended; only high-confidence, fixable issues block.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>What is an SBOM and why would a company want one?</div><div class="a">A machine-readable inventory of every component in an artifact (CycloneDX or SPDX). It turns "are we affected by this CVE?" from a week of investigation into a query, and it's increasingly a compliance requirement (US executive orders, EU CRA, supply-chain questionnaires).</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>Why sign container images?</div><div class="a">To guarantee provenance: a signed image proves it was built by our pipeline and hasn't been tampered with between build and runtime. With cosign plus an admission controller like Kyverno, the cluster simply refuses to run unsigned images.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>How do you handle a critical CVE in a base image with no patched version yet?</div><div class="a">First check exploitability — is the vulnerable package even invoked? Then reduce attack surface (slim/distroless base, remove the package), add a runtime control (WAF, seccomp, network policy), and record a time-boxed suppression with `--ignore-unfixed` so the build is not permanently red. When the upstream fix lands, the suppression expires and the gate re-arms.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q5</span>DAST in CI — how do you keep it fast?</div><div class="a">Use the ZAP baseline (passive, ~1 minute) on every commit against a container started just for the scan, and reserve the full active scan for a nightly job against staging. Keep the scanner on the same network as the app with <code>--network host</code> so there's no external latency.</div></div>
+    </div>
+
+<h3><span class="hn">18.8</span> Under the hood — what an image scanner inspects</h3>
+<p>Trivy does not guess from image metadata; it unpacks the layers and reads the package databases inside the filesystem:</p>
+<div class="tw"><table>
+<thead><tr><th>Source inside the image</th><th>Ecosystem detected</th></tr></thead>
+<tbody>
+<tr><td><span class="path">/lib/apk/db/installed</span></td><td>Alpine (apk)</td></tr>
+<tr><td><span class="path">/var/lib/dpkg/status</span></td><td>Debian / Ubuntu (dpkg)</td></tr>
+<tr><td><span class="path">/var/lib/rpm</span></td><td>RHEL / CentOS (rpm)</td></tr>
+<tr><td><span class="path">**/node_modules/**/package.json</span></td><td>Node (npm / yarn / pnpm)</td></tr>
+<tr><td><span class="path">**/*.dist-info/METADATA</span></td><td>Python (pip)</td></tr>
+<tr><td><span class="path">**/Gemfile.lock</span></td><td>Ruby</td></tr>
+<tr><td><span class="path">**/go.mod</span> and Go binary build info</td><td>Go</td></tr>
+</tbody>
+</table></div>
+<div class="info"><span class="lbl"><span class="ic">💡</span>Why distroless images produce almost no findings</span>
+There is no package manager database, so OS-level CVEs mostly vanish — what remains is your application dependencies (Node or Python), which the scanner still sees. That is a genuine security win, not a scanner blind spot.</div>
+
+<h3><span class="hn">18.9</span> Trivy in depth</h3>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">A production-grade scan command</span><button class="copy">📋 Copy</button></div><pre><code>trivy image \
+  --severity HIGH,CRITICAL \          # only what matters
+  --ignore-unfixed \                  # no fix exists -&gt; track, don't block
+  --exit-code 1 \                     # gate
+  --scanners vuln,secret \            # CVEs + embedded secrets
+  --format table \                    # readable in the console
+  --output trivy-image.txt \
+  user/nodejs-app:abc1234
+
+# Machine-readable for dashboards and the GitHub Security tab:
+trivy image --format sarif     --output trivy.sarif     user/nodejs-app:abc1234
+trivy image --format cyclonedx --output sbom.cdx.json   user/nodejs-app:abc1234
+
+# Cache the database on the agent so scans start instantly
+trivy image --cache-dir /var/lib/jenkins/.cache/trivy ...</code></pre></div>
+<div class="tw"><table>
+<thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>--ignore-unfixed</code></td><td>Skip CVEs with no released fix</td></tr>
+<tr><td><code>--exit-code 1</code></td><td>Turn the scan into a gate</td></tr>
+<tr><td><code>--scanners vuln,secret,misconfig</code></td><td>Choose what to look for</td></tr>
+<tr><td><code>--pkg-types os,library</code></td><td>OS packages and/or application dependencies</td></tr>
+<tr><td><code>--ignore-policy trivy.policy</code></td><td>Rego-based, expiry-aware suppressions</td></tr>
+<tr><td><code>--cache-dir</code></td><td>Persist the vulnerability DB between builds</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">18.10</span> Signing and verification end to end</h3>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">cosign: generate keys, sign, verify</span><button class="copy">📋 Copy</button></div><pre><code># 1. Generate a key pair ONCE (store the private key as a Jenkins credential)
+cosign generate-key-pair                     # -&gt; cosign.key, cosign.pub
+
+# 2. Sign the image DIGEST (never sign a mutable tag)
+cosign sign --key cosign.key user/nodejs-app@sha256:9f8e7d...
+
+# 3. Verify anywhere before running
+cosign verify --key cosign.pub user/nodejs-app:abc1234
+
+# 4. Keyless signing with OIDC (no long-lived key at all -- preferred)
+cosign sign user/nodejs-app@sha256:9f8e7d...
+cosign verify user/nodejs-app:abc1234 \
+  --certificate-identity ci@example.com \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com</code></pre></div>
+<div class="code" data-lang="yaml"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">yaml</span><span class="fn">Kyverno policy — reject unsigned images in the cluster</span><button class="copy">📋 Copy</button></div><pre><code>apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signature
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: require-signature
+      match:
+        any:
+          - resources: { kinds: ["Pod"] }
+      verifyImages:
+        - imageReferences: ["docker.io/*"]
+          attestors:
+            - entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...
+                      -----END PUBLIC KEY-----</code></pre></div>
+
+<h3><span class="hn">18.11</span> Lab — scan a deliberately insecure image</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 18.1 · Watch the gate fire</span>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Build something old and vulnerable, then scan it</span><button class="copy">📋 Copy</button></div><pre><code>mkdir -p /tmp/lab18 &amp;&amp; cd /tmp/lab18
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM node:14-alpine          # EOL Node with many known CVEs
+RUN apk add --no-cache curl bash
+USER root                     # running as root -&gt; misconfiguration finding
+CMD ["node", "-e", "console.log('hi')"]
+EOF
+docker build -t lab18/old-app:1 .
+trivy image --severity HIGH,CRITICAL lab18/old-app:1        # lots of findings
+trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 lab18/old-app:1
+trivy config .                                              # flags USER root</code></pre></div>
+Then repeat with <code>FROM node:20-alpine</code> and a non-root <code>USER</code> and watch the finding count collapse. That difference is the entire argument for multi-stage builds, current base images and non-root users.</div>
+
+<h3><span class="hn">18.12</span> DAST depth — what the ZAP baseline checks</h3>
+<div class="tw"><table>
+<thead><tr><th>Check</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td>Missing security headers</td><td><code>Content-Security-Policy</code>, <code>X-Content-Type-Options</code>, <code>Strict-Transport-Security</code></td></tr>
+<tr><td>Cookie flags</td><td>Missing <code>Secure</code>, <code>HttpOnly</code>, <code>SameSite</code></td></tr>
+<tr><td>Information disclosure</td><td>Stack traces, server version headers, directory listings</td></tr>
+<tr><td>Insecure transport</td><td>Forms posting over HTTP, mixed content</td></tr>
+<tr><td>Known vulnerable components</td><td>Outdated JavaScript libraries (retire.js rules)</td></tr>
+</tbody>
+</table></div>
+<div class="tip"><span class="lbl"><span class="ic">💡</span>Two DAST practices that make it stick</span>
+Run ZAP against a container started <em>just for the scan</em> (as in Block 18.4) so there is no shared state, and fail only on <code>WARN</code> severity or above once the baseline is clean — otherwise the first run floods you with informational noise and the team learns to ignore it.</div>
+
+<h3><span class="hn">18.13</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>When should you scan: before or after pushing the image?</div><div class="a">Scan before pushing so a vulnerable image never reaches the registry — that keeps the registry trustworthy and prevents accidental pulls. I still re-scan after push as a backstop, and schedule periodic rescans of stored images because new CVEs appear for images that were clean when built.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>Why rescan images that already passed?</div><div class="a">Vulnerability databases change daily. An image that was clean in January can have a critical CVE in March without a single byte changing. Continuous rescanning of deployed digests is the only way to know your current exposure.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>What is a policy-as-code admission controller?</div><div class="a">A Kubernetes component (Kyverno, OPA/Gatekeeper, Sigstore policy-controller) that evaluates rules before a pod is admitted — for example "image must be signed by our key", "no <code>latest</code> tags", "no privileged containers". It turns your pipeline's guarantees into enforced runtime policy.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>How do you convince management to invest in signing?</div><div class="a">Frame it as supply-chain integrity: signing plus admission control means an attacker who compromises the registry or a developer laptop cannot get unsigned code into production. It is a small pipeline change that closes a whole class of attacks, and it is increasingly a compliance requirement.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q10</span>Which single security stage gives the best return?</div><div class="a">Secret scanning with gitleaks — it takes seconds, has near-zero false positives, and prevents the most expensive incident class there is: a leaked credential. Then dependency scanning, because that is where the majority of real-world vulnerabilities live.</div></div>
+</div>
+
+<h3><span class="hn">18.8</span> Under the hood — what an image scanner inspects</h3>
+<p>Trivy does not guess from image metadata; it unpacks the layers and reads the package databases inside the filesystem:</p>
+<div class="tw"><table>
+<thead><tr><th>Source inside the image</th><th>Ecosystem detected</th></tr></thead>
+<tbody>
+<tr><td><span class="path">/lib/apk/db/installed</span></td><td>Alpine (apk)</td></tr>
+<tr><td><span class="path">/var/lib/dpkg/status</span></td><td>Debian / Ubuntu (dpkg)</td></tr>
+<tr><td><span class="path">/var/lib/rpm</span></td><td>RHEL / CentOS (rpm)</td></tr>
+<tr><td><span class="path">**/node_modules/**/package.json</span></td><td>Node (npm / yarn / pnpm)</td></tr>
+<tr><td><span class="path">**/*.dist-info/METADATA</span></td><td>Python (pip)</td></tr>
+<tr><td><span class="path">**/Gemfile.lock</span></td><td>Ruby</td></tr>
+<tr><td><span class="path">**/go.mod</span> and Go binary build info</td><td>Go</td></tr>
+</tbody>
+</table></div>
+<div class="info"><span class="lbl"><span class="ic">💡</span>Why distroless images produce almost no findings</span>
+There is no package manager database, so OS-level CVEs mostly vanish — what remains is your application dependencies (Node or Python), which the scanner still sees. That is a genuine security win, not a scanner blind spot.</div>
+
+<h3><span class="hn">18.9</span> Trivy in depth</h3>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">A production-grade scan command</span><button class="copy">📋 Copy</button></div><pre><code>trivy image \
+  --severity HIGH,CRITICAL \          # only what matters
+  --ignore-unfixed \                  # no fix exists -&gt; track, don't block
+  --exit-code 1 \                     # gate
+  --scanners vuln,secret \            # CVEs + embedded secrets
+  --format table \                    # readable in the console
+  --output trivy-image.txt \
+  user/nodejs-app:abc1234
+
+# Machine-readable for dashboards and the GitHub Security tab:
+trivy image --format sarif     --output trivy.sarif     user/nodejs-app:abc1234
+trivy image --format cyclonedx --output sbom.cdx.json   user/nodejs-app:abc1234
+
+# Cache the database on the agent so scans start instantly
+trivy image --cache-dir /var/lib/jenkins/.cache/trivy ...</code></pre></div>
+<div class="tw"><table>
+<thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>--ignore-unfixed</code></td><td>Skip CVEs with no released fix</td></tr>
+<tr><td><code>--exit-code 1</code></td><td>Turn the scan into a gate</td></tr>
+<tr><td><code>--scanners vuln,secret,misconfig</code></td><td>Choose what to look for</td></tr>
+<tr><td><code>--pkg-types os,library</code></td><td>OS packages and/or application dependencies</td></tr>
+<tr><td><code>--ignore-policy trivy.policy</code></td><td>Rego-based, expiry-aware suppressions</td></tr>
+<tr><td><code>--cache-dir</code></td><td>Persist the vulnerability DB between builds</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">18.10</span> Signing and verification end to end</h3>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">cosign: generate keys, sign, verify</span><button class="copy">📋 Copy</button></div><pre><code># 1. Generate a key pair ONCE (store the private key as a Jenkins credential)
+cosign generate-key-pair                     # -&gt; cosign.key, cosign.pub
+
+# 2. Sign the image DIGEST (never sign a mutable tag)
+cosign sign --key cosign.key user/nodejs-app@sha256:9f8e7d...
+
+# 3. Verify anywhere before running
+cosign verify --key cosign.pub user/nodejs-app:abc1234
+
+# 4. Keyless signing with OIDC (no long-lived key at all -- preferred)
+cosign sign user/nodejs-app@sha256:9f8e7d...
+cosign verify user/nodejs-app:abc1234 \
+  --certificate-identity ci@example.com \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com</code></pre></div>
+<div class="code" data-lang="yaml"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">yaml</span><span class="fn">Kyverno policy — reject unsigned images in the cluster</span><button class="copy">📋 Copy</button></div><pre><code>apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signature
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: require-signature
+      match:
+        any:
+          - resources: { kinds: ["Pod"] }
+      verifyImages:
+        - imageReferences: ["docker.io/*"]
+          attestors:
+            - entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...
+                      -----END PUBLIC KEY-----</code></pre></div>
+
+<h3><span class="hn">18.11</span> Lab — scan a deliberately insecure image</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 18.1 · Watch the gate fire</span>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Build something old and vulnerable, then scan it</span><button class="copy">📋 Copy</button></div><pre><code>mkdir -p /tmp/lab18 &amp;&amp; cd /tmp/lab18
+cat &gt; Dockerfile &lt;&lt;'EOF'
+FROM node:14-alpine          # EOL Node with many known CVEs
+RUN apk add --no-cache curl bash
+USER root                     # running as root -&gt; misconfiguration finding
+CMD ["node", "-e", "console.log('hi')"]
+EOF
+docker build -t lab18/old-app:1 .
+trivy image --severity HIGH,CRITICAL lab18/old-app:1        # lots of findings
+trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 lab18/old-app:1
+trivy config .                                              # flags USER root</code></pre></div>
+Then repeat with <code>FROM node:20-alpine</code> and a non-root <code>USER</code> and watch the finding count collapse. That difference is the entire argument for multi-stage builds, current base images and non-root users.</div>
+
+<h3><span class="hn">18.12</span> DAST depth — what the ZAP baseline checks</h3>
+<div class="tw"><table>
+<thead><tr><th>Check</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td>Missing security headers</td><td><code>Content-Security-Policy</code>, <code>X-Content-Type-Options</code>, <code>Strict-Transport-Security</code></td></tr>
+<tr><td>Cookie flags</td><td>Missing <code>Secure</code>, <code>HttpOnly</code>, <code>SameSite</code></td></tr>
+<tr><td>Information disclosure</td><td>Stack traces, server version headers, directory listings</td></tr>
+<tr><td>Insecure transport</td><td>Forms posting over HTTP, mixed content</td></tr>
+<tr><td>Known vulnerable components</td><td>Outdated JavaScript libraries (retire.js rules)</td></tr>
+</tbody>
+</table></div>
+<div class="tip"><span class="lbl"><span class="ic">💡</span>Two DAST practices that make it stick</span>
+Run ZAP against a container started <em>just for the scan</em> (as in Block 18.4) so there is no shared state, and fail only on <code>WARN</code> severity or above once the baseline is clean — otherwise the first run floods you with informational noise and the team learns to ignore it.</div>
+
+<h3><span class="hn">18.13</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>When should you scan: before or after pushing the image?</div><div class="a">Scan before pushing so a vulnerable image never reaches the registry — that keeps the registry trustworthy and prevents accidental pulls. I still re-scan after push as a backstop, and schedule periodic rescans of stored images because new CVEs appear for images that were clean when built.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>Why rescan images that already passed?</div><div class="a">Vulnerability databases change daily. An image that was clean in January can have a critical CVE in March without a single byte changing. Continuous rescanning of deployed digests is the only way to know your current exposure.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>What is a policy-as-code admission controller?</div><div class="a">A Kubernetes component (Kyverno, OPA/Gatekeeper, Sigstore policy-controller) that evaluates rules before a pod is admitted — for example "image must be signed by our key", "no <code>latest</code> tags", "no privileged containers". It turns your pipeline's guarantees into enforced runtime policy.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>How do you convince management to invest in signing?</div><div class="a">Frame it as supply-chain integrity: signing plus admission control means an attacker who compromises the registry or a developer laptop cannot get unsigned code into production. It is a small pipeline change that closes a whole class of attacks, and it is increasingly a compliance requirement.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q10</span>Which single security stage gives the best return?</div><div class="a">Secret scanning with gitleaks — it takes seconds, has near-zero false positives, and prevents the most expensive incident class there is: a leaked credential. Then dependency scanning, because that is where the majority of real-world vulnerabilities live.</div></div>
+</div>
+</section>

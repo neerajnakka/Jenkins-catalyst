@@ -1,0 +1,224 @@
+<section class="block" id="block-3" data-block="3" data-title="Snippet Generator &amp; syntax tooling">
+    <div class="bhead"><div class="bnum">03</div><div>
+      <div class="bl">Block 3 · Foundation</div>
+      <h2>Snippet Generator &amp; syntax tooling</h2>
+      <p class="bgoal"><b>Goal:</b> stop memorising step syntax. Generate it, validate it, lint it — and iterate with Replay so you never wait on a Git push to find out a step is wrong.</p>
+    </div></div>
+
+    <h3><span class="hn">3.1</span> The four tools built into every Jenkins</h3>
+    <div class="grid2">
+      <div class="card"><h5>🔧 Snippet Generator</h5><p><span class="path">/pipeline-syntax/</span> — pick a step, fill a form, get the exact Groovy. For <em>steps</em>.</p></div>
+      <div class="card"><h5>📐 Declarative Directive Generator</h5><p><span class="path">/directive-generator/</span> — same idea, but for <em>sections</em> like <code>options</code>, <code>when</code>, <code>triggers</code>, <code>parameters</code>.</p></div>
+      <div class="card"><h5>📖 Global Variable Reference</h5><p><span class="path">/pipeline-syntax/globals</span> — every built-in variable (<code>env</code>, <code>currentBuild</code>, <code>params</code>, <code>scm</code>) with real values from your own controller.</p></div>
+      <div class="card"><h5>🔁 Replay</h5><p>On any finished build: edit the Jenkinsfile in the browser and rerun instantly, without a commit.</p></div>
+    </div>
+    <div class="info"><span class="lbl"><span class="ic">🔗</span>How to reach them</span>
+    From any job: click <strong>Pipeline Syntax</strong> in the left menu. Or go direct: <span class="path">http://&lt;jenkins&gt;:8080/pipeline-syntax/</span>. They're always available on the controller, even before you create a job.</div>
+
+    <h3><span class="hn">3.2</span> Using the Snippet Generator (do this once, properly)</h3>
+    <ol class="steps">
+      <li><strong>Sample Step ▾</strong> → choose the step, e.g. <code>sh: Shell Script</code>. The form changes to match.</li>
+      <li>Fill the fields — for <code>sh</code> you get <em>Script</em>, plus advanced options like <code>returnStdout</code> and <code>returnStatus</code>.</li>
+      <li>Click <strong>Generate Groovy</strong>. Copy the output into your Jenkinsfile's <code>steps</code> block.</li>
+    </ol>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Output of the generator for a few common steps</span><button class="copy">📋 Copy</button></div><pre><code>// 1. sh  ->  Shell Script
+sh 'npm ci'
+
+//    ...with advanced options ticked:
+sh label: 'install dependencies', returnStdout: true, script: 'npm ci'
+
+// 2. git  ->  Git  (Block 4)
+git branch: 'main', credentialsId: 'github-ssh', url: 'git@github.com:you/repo.git'
+
+// 3. checkout  ->  Check out from version control  (modern form, Block 4)
+checkout scmGit(branches: [[name: '*/main']],
+                extensions: [],
+                userRemoteConfigs: [[credentialsId: 'github-ssh',
+                                     url: 'git@github.com:you/repo.git']])
+
+// 4. withCredentials  ->  Bind credentials to variables  (Block 8)
+withCredentials([usernamePassword(credentialsId: 'dockerhub',
+                                  passwordVariable: 'DOCKER_PASS',
+                                  usernameVariable: 'DOCKER_USER')]) {
+    sh 'echo $DOCKER_USER'
+}
+
+// 5. junit  ->  Publish JUnit test result report  (Block 6)
+junit testResults: 'reports/junit.xml', allowEmptyResults: true
+
+// 6. archiveArtifacts  ->  Archive the artifacts  (Block 11)
+archiveArtifacts artifacts: 'coverage/**', fingerprint: true
+
+// 7. cleanWs  ->  Delete workspace when build is done  (Block 11)
+cleanWs()</code></pre></div>
+
+    <div class="tip"><span class="lbl"><span class="ic">🎯</span>The professional shortcut</span>
+    You will never remember <code>checkout scmGit(...)</code> by heart. Nobody does. What senior engineers remember is <em>which steps exist</em> and where to generate them. That's the skill. Use the generator for the exact syntax every single time.</div>
+
+    <h3><span class="hn">3.3</span> Declarative Directive Generator — for blocks, not steps</h3>
+    <p>When you need correct syntax for <code>when</code>, <code>options</code>, <code>triggers</code>, <code>parameters</code> or <code>tools</code>, use <span class="path">/directive-generator/</span>. Choose the directive, fill the form, paste.</p>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Generated declarative directives</span><button class="copy">📋 Copy</button></div><pre><code>// when: branch is main          (directive: when -> branch)
+when {
+    branch 'main'
+}
+
+// when: any of / all of / not   (directive: when -> allOf / anyOf / not)
+when {
+    allOf {
+        branch 'main'
+        expression { params.DEPLOY == true }
+    }
+}
+
+// options: timeout + timestamps (directive: options -> timeout / timestamps)
+options {
+    timeout(time: 30, unit: 'MINUTES')
+    timestamps()
+}
+
+// triggers: pollSCM             (directive: triggers -> pollSCM)
+triggers {
+    pollSCM('H/5 * * * *')
+}
+
+// parameters: choice            (directive: parameters -> choice)
+parameters {
+    choice choices: ['dev', 'qa', 'prod'], description: 'Target env', name: 'ENV'
+}</code></pre></div>
+
+    <h3><span class="hn">3.4</span> Validate a Jenkinsfile without running it</h3>
+    <p>Jenkins ships a REST endpoint that parses your Jenkinsfile and returns either "successfully validated" or the exact parse error. Wire it into your editor or a pre-commit hook.</p>
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">scripts/validate-jenkinsfile.sh</span><button class="copy">📋 Copy</button></div><pre><code>#!/usr/bin/env bash
+# Validate a Jenkinsfile against the controller WITHOUT triggering a build.
+# Usage: ./scripts/validate-jenkinsfile.sh nodejs-app/Jenkinsfile
+set -euo pipefail
+JENKINS_URL="${JENKINS_URL:-http://localhost:8080}"
+USER="${JENKINS_USER:?set JENKINS_USER}"
+TOKEN="${JENKINS_TOKEN:?set JENKINS_TOKEN}"   # Manage Jenkins -> Users -> API Token
+FILE="${1:?path to Jenkinsfile}"
+
+CRUMB=$(curl -s -u "$USER:$TOKEN" "$JENKINS_URL/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,\":\",//crumb)")
+
+curl -s -u "$USER:$TOKEN" -H "$CRUMB" \
+     -F "jenkinsfile=&lt;$FILE" \
+     "$JENKINS_URL/pipeline-model-converter/validate" | tee /tmp/validate.out
+
+grep -q "successfully validated" /tmp/validate.out \
+  &amp;&amp; echo "✅ Jenkinsfile is valid" \
+  || { echo "❌ Jenkinsfile has errors (see above)"; exit 1; }</code></pre></div>
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>Validation is syntax-only</span>
+    This endpoint checks that the pipeline <em>parses</em>. It does not check that your credentials exist, that the branch is real, or that npm will succeed. Syntax valid ≠ build green.</div>
+
+    <h3><span class="hn">3.5</span> Tooling around Jenkins</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Tool</th><th>What it gives you</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Replay</strong> (built-in)</td><td>Edit + rerun a failed build's Jenkinsfile in the browser. The fastest debug loop that exists.</td></tr>
+        <tr><td><strong>VS Code · Jenkins Doc + Pipeline Linter</strong></td><td>Snippets, auto-complete and offline linting while you type.</td></tr>
+        <tr><td><strong><code>npm-groovy-lint</code></strong></td><td>CLI linter for Groovy/Jenkinsfile: <code>npx npm-groovy-lint --path Jenkinsfile</code></td></tr>
+        <tr><td><strong>Jenkinsfile in <code>pre-commit</code></strong></td><td>Run the validate endpoint before every commit so broken syntax never reaches CI.</td></tr>
+        <tr><td><strong>Blue Ocean / Pipeline Graph View</strong></td><td>Per-stage logs, visual graph, rerun a single failed stage.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">3.6</span> The debug loop I actually use</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Three tricks that save hours</span><button class="copy">📋 Copy</button></div><pre><code>// 1. Print everything the pipeline can see
+sh 'env | sort'                       // shell environment
+echo sh(script: 'printenv | sort', returnStdout: true)
+echo "Params: ${params}"
+echo "Env: ${env.getEnvironment()}"
+
+// 2. Turn on shell tracing for ONE command (instead of the whole job)
+sh 'set -x; npm ci'
+
+// 3. Keep the workspace when a build fails, so you can inspect it
+post {
+    failure { archiveArtifacts artifacts: '**/*.log', allowEmptyArchive: true }
+    // and NEVER cleanWs() while you are still debugging
+}</code></pre></div>
+
+    <h3><span class="hn">3.7</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>Opened <span class="path">/pipeline-syntax/</span> and generated an <code>sh</code> step by hand.</li>
+      <li>Generated a <code>when { branch 'main' }</code> directive from <span class="path">/directive-generator/</span>.</li>
+      <li>Opened <span class="path">/pipeline-syntax/globals</span> and found <code>env.BUILD_URL</code>.</li>
+      <li>Used <strong>Replay</strong> to change a stage name and rerun without committing.</li>
+      <li>Validated a Jenkinsfile with the <code>pipeline-model-converter/validate</code> endpoint.</li>
+    </ul>
+
+    <h3><span class="hn">3.8</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>How do you write a Jenkinsfile without memorising syntax?</div><div class="a">I use the built-in Snippet Generator for steps and the Declarative Directive Generator for sections, validate with the <code>pipeline-model-converter/validate</code> REST endpoint, and iterate with Replay so I don't need a Git commit per attempt. What I do memorise is the catalogue of available steps.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>What is Replay and when is it useful?</div><div class="a">Replay lets you edit the Jenkinsfile of a completed build directly in the browser and rerun it. It's ideal for debugging — you iterate in seconds without pushing commits. Once it's green you copy the final version back into the repo and commit.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>Someone says their Jenkinsfile "compiles" but the build fails. Explain.</div><div class="a">Validation only proves the Groovy parses and the declarative structure is legal. Runtime problems — a missing credential ID, an unreachable branch, a failing <code>npm ci</code> — are discovered only when steps execute.</div></div>
+    </div>
+
+<h3><span class="hn">3.7</span> Under the hood — where the generator gets its list</h3>
+<p>Every Jenkins step is a Java class registered for discovery (<code>@Extension</code> + <code>Describable</code> with <code>@DataBoundConstructor</code>/<code>@DataBoundSetter</code>). The generator reads that metadata, renders a form, and serialises your inputs back to Groovy. Three consequences:</p>
+<ul>
+<li><strong>A step only appears if its plugin is installed.</strong> "No such DSL method" usually means a missing plugin, not bad syntax.</li>
+<li><strong>Not every step has a form.</strong> Older steps expose only raw parameters under <em>Advanced</em>.</li>
+<li><strong>Generated code is canonical.</strong> When unsure, generate — don't invent.</li>
+</ul>
+
+<h4>Catalogue of steps you should know exist</h4>
+<div class="tw"><table>
+<thead><tr><th>Category</th><th>Steps</th></tr></thead>
+<tbody>
+<tr><td>Files &amp; workspace</td><td><code>dir</code> · <code>deleteDir</code> · <code>fileExists</code> · <code>readFile</code> · <code>writeFile</code> · <code>readJSON</code> · <code>writeJSON</code> · <code>stash</code> · <code>unstash</code> · <code>cleanWs</code></td></tr>
+<tr><td>Shell</td><td><code>sh</code> · <code>bat</code> · <code>powershell</code> · <code>returnStdout</code> · <code>returnStatus</code> · <code>label</code></td></tr>
+<tr><td>SCM</td><td><code>checkout</code> · <code>git</code> · <code>scmGit</code> · <code>changelog</code></td></tr>
+<tr><td>Credentials</td><td><code>withCredentials</code> · <code>sshagent</code> · <code>withVault</code> (plugin)</td></tr>
+<tr><td>Reports</td><td><code>junit</code> · <code>recordCoverage</code> · <code>recordIssues</code> · <code>archiveArtifacts</code> · <code>publishHTML</code></td></tr>
+<tr><td>Flow</td><td><code>parallel</code> · <code>timeout</code> · <code>retry</code> · <code>waitUntil</code> · <code>sleep</code> · <code>lock</code> · <code>milestone</code> · <code>input</code> · <code>build</code></td></tr>
+<tr><td>Results</td><td><code>error</code> · <code>catchError</code> · <code>warnError</code> · <code>unstable</code></td></tr>
+<tr><td>Docker</td><td><code>docker.build</code> · <code>docker.withRegistry</code> · <code>image.inside/withRun/run/push/pull</code></td></tr>
+<tr><td>Notify</td><td><code>slackSend</code> · <code>emailext</code> · <code>httpRequest</code></td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">3.8</span> Lab — generate three steps you'll use every day</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 3.1 · Snippet Generator drill</span>
+Open <span class="path">/pipeline-syntax/</span>, generate each of these, and compare with the canonical output.
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">1) sh with a label and captured output</span><button class="copy">📋 Copy</button></div><pre><code>// Sample Step: sh: Shell Script
+//   Script:  git rev-parse --short HEAD
+//   Advanced -> [x] Return standard output
+sh label: 'read short commit sha', returnStdout: true, script: 'git rev-parse --short HEAD'</code></pre></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">2) junit with tolerant settings</span><button class="copy">📋 Copy</button></div><pre><code>// Sample Step: junit: Publish JUnit test result report
+//   Test report XMLs: **/reports/junit.xml
+//   [x] Allow empty results   [x] Keep long stdout/stderr
+junit allowEmptyResults: true, keepLongStdio: true, testResults: '**/reports/junit.xml'</code></pre></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">3) withCredentials (secret text)</span><button class="copy">📋 Copy</button></div><pre><code>// Sample Step: withCredentials: Bind credentials to variables
+//   Bindings: Secret text -> Variable: SONAR_TOKEN, Credentials: sonar-token
+withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+    sh 'echo "token length: ${#SONAR_TOKEN}"'      // never echo the value itself
+}</code></pre></div>
+Then open <span class="path">/directive-generator/</span> and generate <code>options → timeout</code> and <code>when → anyOf</code>.</div>
+
+<h3><span class="hn">3.9</span> Editor &amp; CLI tooling</h3>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Local lint + a pre-commit hook</span><button class="copy">📋 Copy</button></div><pre><code># Local Groovy lint (no Jenkins needed)
+npx npm-groovy-lint --path nodejs-app/Jenkinsfile --failon warning
+
+# Block broken syntax before it reaches CI
+cat &gt; .git/hooks/pre-commit &lt;&lt;'HOOK'
+#!/usr/bin/env bash
+set -e
+for f in $(git diff --cached --name-only | grep -E 'Jenkinsfile$'); do
+  echo "validating $f"
+  ./scripts/validate-jenkinsfile.sh "$f"
+done
+HOOK
+chmod +x .git/hooks/pre-commit</code></pre></div>
+<div class="code" data-lang="json"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">json</span><span class="fn">.vscode/settings.json</span><button class="copy">📋 Copy</button></div><pre><code>{
+  "files.associations": { "Jenkinsfile*": "groovy" },
+  "editor.formatOnSave": false,
+  "[groovy]": { "editor.tabSize": 4 }
+}</code></pre></div>
+
+<h3><span class="hn">3.10</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q4</span>How do you lint a Jenkinsfile in CI itself?</div><div class="a">I run <code>npm-groovy-lint</code> plus the Jenkins <code>/pipeline-model-converter/validate</code> endpoint in a lightweight "pipeline lint" job and in a pre-commit hook, so broken syntax is caught before it ever consumes an executor.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q5</span>Where do you find the list of available environment variables?</div><div class="a"><span class="path">/pipeline-syntax/globals</span> — the Global Variable Reference, which renders the real values from my controller including <code>env</code>, <code>currentBuild</code>, <code>params</code>, <code>docker</code> and <code>scm</code>.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q6</span>A step you generated isn't recognised at runtime. Why?</div><div class="a">The generator lists steps from plugins installed on the controller that rendered it. If the plugin is missing where the pipeline runs, or was updated and the step renamed, you get "No such DSL method". I verify the plugin in <em>Manage Jenkins → Plugins</em> and check the changelog for renames.</div></div>
+</div>
+</section>

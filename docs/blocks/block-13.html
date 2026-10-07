@@ -1,0 +1,408 @@
+<section class="block" id="block-13" data-block="13" data-title="Nodes, agents, labels &amp; tools">
+    <div class="bhead"><div class="bnum">13</div><div>
+      <div class="bl">Block 13 · Real engineering</div>
+      <h2>Nodes, agents, labels &amp; tool installers</h2>
+      <p class="bgoal"><b>Goal:</b> stop running builds on the controller. Add agents, route work with labels, and let Jenkins install toolchains for you.</p>
+    </div></div>
+
+    <h3><span class="hn">13.1</span> First: set controller executors to 0</h3>
+    <div class="dang"><span class="lbl"><span class="ic">🚨</span>The production rule</span>
+    <em>Manage Jenkins → Nodes → Built-In Node → Configure → # of executors → <strong>0</strong></em>. Builds on the controller can: exhaust memory and take the UI down, read every credential on the box, and break Jenkins for everyone. A controller orchestrates; agents execute.</div>
+    <figure><pre class="ascii">
+  BUILT-IN NODE (controller)          AGENTS
+  ┌────────────────────────┐         ┌───────────────────────────┐
+  │ executors: 0   ⬅ set   │   SSH   │ linux-1   labels: linux   │
+  │ web UI, scheduler      │ ──────▶ │           docker  node20  │
+  │ credentials, plugins   │         ├───────────────────────────┤
+  │ NO BUILDS              │   SSH   │ python-1  labels: linux   │
+  └────────────────────────┘ ──────▶ │           python3         │
+                                     └───────────────────────────┘</pre>
+    <figcaption>Figure 13.1 — Controller with zero executors dispatching to labelled agents.</figcaption></figure>
+
+    <h3><span class="hn">13.2</span> Adding a permanent agent over SSH</h3>
+    <ol class="steps">
+      <li><strong>Prepare the agent machine</strong> (Ubuntu): install Java, git and whatever your builds need. Create the same user you'll connect as.</li>
+    </ol>
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">On the new agent VM</span><button class="copy">📋 Copy</button></div><pre><code>sudo apt-get update -y
+sudo apt-get install -y openjdk-21-jre-headless git docker.io
+sudo useradd -m -s /bin/bash jenkins
+sudo mkdir -p /home/jenkins/agent &amp;&amp; sudo chown -R jenkins:jenkins /home/jenkins/agent
+
+# The controller connects with an SSH key -> put its PUBLIC key here:
+sudo -iu jenkins bash -c 'mkdir -p ~/.ssh &amp;&amp; chmod 700 ~/.ssh &amp;&amp; \
+  echo "ssh-ed25519 AAAA... jenkins@controller" &gt; ~/.ssh/authorized_keys &amp;&amp; \
+  chmod 600 ~/.ssh/authorized_keys'</code></pre></div>
+    <ol class="steps" start="2">
+      <li><strong>Store the private key in Jenkins:</strong> Credentials → <em>SSH Username with private key</em> → ID <code>agent-key</code>.</li>
+      <li><strong>Register the node:</strong> Manage Jenkins → Nodes → <em>New Node</em> → name <code>linux-1</code> → <em>Permanent Agent</em>:<br/>
+        <strong>Remote root directory:</strong> <span class="path">/home/jenkins/agent</span><br/>
+        <strong>Labels:</strong> <code>linux docker node20</code> (space-separated)<br/>
+        <strong>Usage:</strong> <em>Only build jobs with label expressions matching this node</em><br/>
+        <strong>Launch method:</strong> <em>Launch agents via SSH</em> → Host: private IP → Credentials: <code>agent-key</code> → Host Key Verification: <em>Non verifying</em> (or <em>Known hosts file</em> for production)</li>
+      <li><strong>Save</strong> and watch it connect. If it fails, click the node → <em>Log</em> — the launch log tells you exactly why.</li>
+    </ol>
+
+    <h3><span class="hn">13.3</span> Labels — how work is routed</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Label expressions</span><button class="copy">📋 Copy</button></div><pre><code>agent { label 'docker' }                 // any agent labelled docker
+agent { label 'linux &amp;&amp; node20' }        // both labels
+agent { label 'docker || aws' }          // either
+agent { label 'linux &amp;&amp; !experimental' } // linux, but not the experimental box
+agent { label "${params.AGENT_LABEL}" }  // chosen at build time</code></pre></div>
+    <div class="tip"><span class="lbl"><span class="ic">🏷️</span>Label naming conventions that scale</span>
+    Label by <strong>capability</strong>, not by hostname: <code>linux</code>, <code>windows</code>, <code>docker</code>, <code>node20</code>, <code>python3.12</code>, <code>arm64</code>, <code>gpu</code>. Then when a machine dies you replace it with another carrying the same labels and no pipeline changes. If you label by host (<code>agent-7</code>), every pipeline is hard-wired to a box.</div>
+
+    <h3><span class="hn">13.4</span> Tool installers — no more "works on my machine"</h3>
+    <p>Install the <strong>NodeJS</strong> plugin, then <em>Manage Jenkins → Tools → NodeJS installations</em> → Add NodeJS → name <code>node20</code> → version <code>NodeJS 20.x</code>. Pipelines then reference it by name:</p>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">tools {} — auto-install + PATH injection</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent { label 'linux' }
+
+    tools {
+        nodejs 'node20'          // name must match Manage Jenkins -> Tools
+        // jdk   'jdk21'
+        // maven 'maven3'
+        // git   'Default'
+    }
+
+    stages {
+        stage('Verify') {
+            steps { sh 'node -v &amp;&amp; npm -v' }   // PATH points at the installed tool
+        }
+    }
+}</code></pre></div>
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>Installers download on every fresh agent</span>
+    Auto-installers fetch the toolchain on first use — great for correctness, slow on ephemeral agents. At scale, bake tools into the agent image (Packer/Ansible) and just declare them, or use Docker agents (next section).</div>
+
+    <h3><span class="hn">13.5</span> Docker agents — the cleanest build environment</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Run stages inside containers</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent none
+    stages {
+        stage('Node tests') {
+            agent {
+                docker {
+                    image 'node:20-alpine'
+                    args  '-v /var/lib/jenkins/.npm:/root/.npm'   // persist the npm cache
+                    reuseNode true                                // stay on the same node/workspace
+                }
+            }
+            steps { sh 'node -v &amp;&amp; npm ci &amp;&amp; npm run test:junit' }
+        }
+
+        stage('Python tests') {
+            agent { docker { image 'python:3.12-slim'; reuseNode true } }
+            steps { sh 'python -m venv venv &amp;&amp; . venv/bin/activate &amp;&amp; pip install -r requirements-dev.txt &amp;&amp; pytest' }
+        }
+
+        stage('Build image') {
+            agent { label 'docker' }          // needs the docker socket -> host agent
+            steps { sh 'docker build -t app:$GIT_SHA .' }
+        }
+    }
+}</code></pre></div>
+    <div class="info"><span class="lbl"><span class="ic">🔁</span><code>reuseNode</code> matters</span>
+    By default a <code>docker</code> agent allocates a <em>new</em> workspace on a possibly different node. <code>reuseNode true</code> keeps the same node and workspace, so files from earlier stages are still there — usually what you want inside a single pipeline.</div>
+
+    <h3><span class="hn">13.6</span> Which agent strategy when?</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Approach</th><th>Pros</th><th>Cons</th><th>Best for</th></tr></thead>
+      <tbody>
+        <tr><td>Built-in node</td><td>Zero setup</td><td>Insecure, doesn't scale</td><td>Learning only</td></tr>
+        <tr><td>Permanent SSH agents</td><td>Persistent caches, predictable</td><td>You patch and maintain them</td><td>Small stable teams</td></tr>
+        <tr><td>Docker agents</td><td>Perfectly reproducible toolchains</td><td>Needs docker on the host; socket risk</td><td>Polyglot repos (ours!)</td></tr>
+        <tr><td>Cloud / Kubernetes</td><td>Auto-scales, ephemeral, isolated</td><td>Setup complexity, cold starts</td><td>Large teams, bursty load</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">13.7</span> ✍️ Jenkinsfiles v13 — labelled + containerised</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Pattern to add to BOTH apps</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent none                       // nothing reserved for the whole run
+
+    options { timestamps(); timeout(time: 30, unit: 'MINUTES'); disableConcurrentBuilds() }
+
+    stages {
+        stage('Checkout') {
+            agent { label 'linux' }
+            steps { checkout scm }   // now correct: Multibranch supplies scm (Block 15)
+        }
+
+        // --- Node version of the test stage ---
+        stage('Test (Node 20)') {
+            agent { docker { image 'node:20-alpine'; args '-v /var/lib/jenkins/.npm:/root/.npm'; reuseNode true } }
+            steps { sh 'npm ci &amp;&amp; npm run test:junit' }
+        }
+
+        stage('Package &amp; push') {
+            agent { label 'docker' }
+            steps {
+                script {
+                    def img = docker.build("${IMAGE}:${env.GIT_SHA}", '--pull .')
+                    docker.withRegistry('https://index.docker.io/v1/', 'dockerhub-creds') {
+                        img.push(env.GIT_SHA)
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always { junit testResults: 'reports/junit.xml', allowEmptyResults: true }
+        cleanup { node('linux') { cleanWs() } }   // post has no agent -> ask for one
+    }
+}</code></pre></div>
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>The <code>post</code>-with-<code>agent none</code> trap</span>
+    When the pipeline uses <code>agent none</code>, a top-level <code>post</code> block has <strong>no node</strong>, so steps like <code>sh</code> or <code>cleanWs</code> fail with "Required context class hudson.FilePath is missing". Wrap them in <code>node('label') { … }</code> — as above.</div>
+
+    <h3><span class="hn">13.8</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>Controller executors set to 0 (or at least you know why you haven't yet).</li>
+      <li>One SSH agent connected, with meaningful labels.</li>
+      <li>NodeJS tool installer configured and referenced by <code>tools { nodejs 'node20' }</code>.</li>
+      <li>A stage ran inside <code>node:20-alpine</code> and you saw Jenkins pull the image.</li>
+    </ul>
+
+    <h3><span class="hn">13.9</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>Why shouldn't builds run on the controller?</div><div class="a">Because the controller holds all credentials and serves the UI. A build running there can read every secret, consume all memory and take CI down for the whole company. I set the built-in node's executors to 0 and run everything on agents.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>How does Jenkins decide which agent runs a build?</div><div class="a">By label expression. The pipeline declares <code>agent { label 'docker &amp;&amp; linux' }</code>; Jenkins picks any connected agent whose labels satisfy it and has a free executor. If none qualifies the build waits in the queue.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>Permanent agents vs Docker agents vs Kubernetes?</div><div class="a">Permanent agents are simple and give warm caches but need maintenance. Docker agents give a reproducible, version-pinned toolchain per stage with no host pollution — ideal for polyglot repos. Kubernetes agents auto-scale and are fully ephemeral, at the cost of setup complexity and cold-start time.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>An agent keeps going offline. How do you investigate?</div><div class="a">Check the node's launch log in Jenkins first, then from the controller: network reachability, SSH credentials, Java present on the agent, disk space in the remote root directory, and clock skew. For flapping agents I look at <code>journalctl</code> on the agent and the controller's <span class="path">jenkins.log</span>.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q5</span>What does the <code>tools</code> block do?</div><div class="a">It references a tool configured under Manage Jenkins → Tools by name, installs it on the agent if needed, and prepends it to <code>PATH</code> for the duration of the pipeline — so <code>node -v</code> resolves to the exact version the project wants.</div></div>
+    </div>
+
+<h3><span class="hn">13.10</span> Under the hood — how an agent connects</h3>
+<div class="tw"><table>
+<thead><tr><th>Launch method</th><th>Who initiates</th><th>Requirements</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td><strong>SSH (outbound)</strong></td><td>Controller → agent</td><td>SSH server + Java on agent; key credential in Jenkins</td><td>Permanent VMs, on-prem</td></tr>
+<tr><td><strong>Inbound / JNLP</strong></td><td>Agent → controller</td><td>Port 50000 (or WebSocket); agent jar + secret</td><td>Agents behind NAT</td></tr>
+<tr><td><strong>Docker / Kubernetes</strong></td><td>Controller → cloud API</td><td>Docker host or k8s cluster credentials</td><td>Ephemeral, auto-scaling</td></tr>
+</tbody>
+</table></div>
+<figure><pre class="ascii">
+ CONTROLLER                                   AGENT
+ ┌───────────────────────┐                    ┌───────────────────────┐
+ │ Node definition       │   outbound SSH     │ sshd                  │
+ │  name, labels,        │ ─────────────────▶ │ java (remoting.jar)   │
+ │  remoteFS, executors  │   (controller      │ /home/jenkins/agent   │
+ │                       │    connects out)   │                       │
+ │  remoting channel ◀───┼────────────────────┼─► channel established │
+ └───────────────────────┘                    └───────────────────────┘
+        │                                              │
+        └──── FilePath ops, process launch, log ───────┘
+             streaming all travel the remoting channel</pre>
+<figcaption>Figure 13.2 — The remoting channel carries file operations, process launches and log streaming.</figcaption></figure>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Inbound (JNLP) agent — for agents that can't be reached inbound</span><button class="copy">📋 Copy</button></div><pre><code># On the agent: download the launcher and connect out to the controller
+curl -sSLO http://&lt;jenkins&gt;:8080/jnlpJars/agent.jar
+java -jar agent.jar \
+  -url http://&lt;jenkins&gt;:8080/ \
+  -secret &lt;SECRET_FROM_NODE_PAGE&gt; \
+  -name linux-2 \
+  -workDir /home/jenkins/agent &amp;
+
+# As a systemd unit so it survives reboots:
+sudo tee /etc/systemd/system/jenkins-agent.service &gt;/dev/null &lt;&lt;'UNIT'
+[Unit]
+Description=Jenkins Inbound Agent
+After=network.target
+[Service]
+User=jenkins
+ExecStart=/usr/bin/java -jar /opt/agent/agent.jar -url http://&lt;jenkins&gt;:8080/ -secret &lt;SECRET&gt; -name linux-2 -workDir /home/jenkins/agent
+Restart=always
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl enable --now jenkins-agent</code></pre></div>
+
+<h3><span class="hn">13.11</span> Tool installers vs baked images</h3>
+<div class="tw"><table>
+<thead><tr><th>Approach</th><th>Pros</th><th>Cons</th><th>Choose when</th></tr></thead>
+<tbody>
+<tr><td><strong>Auto-installer</strong> (<code>tools{}</code>)</td><td>Zero agent prep; version controlled in the pipeline</td><td>Downloads on cold agents; slower first build</td><td>Small teams, few toolchains</td></tr>
+<tr><td><strong>Baked agent image</strong> (Packer/Ansible)</td><td>Fast, reproducible, no network at build time</td><td>You maintain the image</td><td>Scale, air-gapped, strict reproducibility</td></tr>
+<tr><td><strong>Docker agent</strong> (<code>agent { docker }</code>)</td><td>Exact toolchain per stage, zero host pollution</td><td>Needs Docker on the host; socket risk</td><td>Polyglot repos — our choice</td></tr>
+</tbody>
+</table></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Docker agent with a persistent cache mount and a sidecar network</span><button class="copy">📋 Copy</button></div><pre><code>stage('Integration tests') {
+    agent {
+        docker {
+            image 'node:20-alpine'
+            args  '-v /var/lib/jenkins/.npm:/root/.npm ' +
+                  '--network ci-net ' +                  // reach a sidecar by name
+                  '-e TZ=UTC'
+            reuseNode true
+        }
+    }
+    steps {
+        sh 'npm ci &amp;&amp; npm run test:integration'
+    }
+}</code></pre></div>
+
+<h3><span class="hn">13.12</span> Lab — capacity planning on one machine</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 13.1 · How many executors should this box have?</span>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Measure, then decide</span><button class="copy">📋 Copy</button></div><pre><code>nproc                                  # vCPUs
+free -g                                # RAM
+# Rule of thumb for build agents:
+#   executors ~= min(vCPU, floor(RAM_GB / 2))
+#   4 vCPU / 8 GB  -&gt; 4 executors (if builds are CPU bound, start with 2-3)
+# A controller needs ~1 GB + 1 GB per 100 jobs for the UI alone.</code></pre></div>
+Then deliberately over-subscribe: set 8 executors on a 2-CPU box, run 4 builds at once, and watch the queue and load average. You will feel why "more executors" is not automatically "faster".</div>
+
+<h3><span class="hn">13.13</span> Kubernetes agents (the scale answer)</h3>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Ephemeral pod agent — one pod per build, destroyed after</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent {
+        kubernetes {
+            label 'nodejs-agent'
+            defaultContainer 'node'
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: node
+    image: node:20-alpine
+    command: ['cat']
+    tty: true
+    resources:
+      requests: { cpu: "500m", memory: "1Gi" }
+      limits:   { cpu: "2",    memory: "2Gi" }
+  - name: dind
+    image: docker:24-dind
+    securityContext: { privileged: true }
+'''
+        }
+    }
+    stages {
+        stage('Test')  { steps { container('node') { sh 'npm ci &amp;&amp; npm test' } } }
+        stage('Build') { steps { container('dind') { sh 'docker build -t app:$GIT_SHA .' } } }
+    }
+}</code></pre></div>
+<div class="info"><span class="lbl"><span class="ic">💡</span>Why this matters at scale</span>
+Every build gets a clean, disposable environment — no workspace drift, no "someone installed something weird on agent 3". The cost is pod start-up latency (typically 5–20 s) and the need to cache dependencies in a PVC or registry.</div>
+
+<h3><span class="hn">13.14</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>SSH agent vs JNLP agent?</div><div class="a">SSH agents are launched by the controller, so the agent needs a reachable SSH server — simple and firewall-friendly if the controller can reach it. JNLP/inbound agents dial out to the controller, which is the right choice when the agent sits behind NAT or a firewall. Both carry the same remoting traffic.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>How many executors per agent?</div><div class="a">Roughly one per vCPU, bounded by RAM (≈2 GB per concurrent build for typical Node/Python work), and validated by watching load average and build duration. Over-subscribing makes every build slower and increases flakiness from resource contention.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>How do you keep agent toolchains consistent?</div><div class="a">I don't rely on whatever happens to be installed: either the pipeline declares <code>agent { docker { image 'node:20.17-alpine3.20' } }</code> so the toolchain is pinned per stage, or the agent image is built by Packer/Ansible and version-controlled. Ad-hoc installs on long-lived agents always drift.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>What happens to running builds when an agent dies?</div><div class="a">The remoting channel breaks, the build is marked as failed (or retried if you configured agent-loss retry conditions), and the queue reassigns waiting builds to another agent with the same label. With durable pipelines the state is preserved up to the last checkpoint.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q10</span>How would you autoscale Jenkins?</div><div class="a">Kubernetes agents (one pod per build) or a cloud plugin (EC2, Azure VM agents) that provisions on demand and terminates idle agents. I'd set idle-retention to a few minutes, cap the maximum instances to control cost, and keep one small always-on agent for fast feedback.</div></div>
+</div>
+
+<h3><span class="hn">13.10</span> Under the hood — how an agent connects</h3>
+<div class="tw"><table>
+<thead><tr><th>Launch method</th><th>Who initiates</th><th>Requirements</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td><strong>SSH (outbound)</strong></td><td>Controller → agent</td><td>SSH server + Java on agent; key credential in Jenkins</td><td>Permanent VMs, on-prem</td></tr>
+<tr><td><strong>Inbound / JNLP</strong></td><td>Agent → controller</td><td>Port 50000 (or WebSocket); agent jar + secret</td><td>Agents behind NAT</td></tr>
+<tr><td><strong>Docker / Kubernetes</strong></td><td>Controller → cloud API</td><td>Docker host or k8s cluster credentials</td><td>Ephemeral, auto-scaling</td></tr>
+</tbody>
+</table></div>
+<figure><pre class="ascii">
+ CONTROLLER                                   AGENT
+ ┌───────────────────────┐                    ┌───────────────────────┐
+ │ Node definition       │   outbound SSH     │ sshd                  │
+ │  name, labels,        │ ─────────────────▶ │ java (remoting.jar)   │
+ │  remoteFS, executors  │   (controller      │ /home/jenkins/agent   │
+ │                       │    connects out)   │                       │
+ │  remoting channel ◀───┼────────────────────┼─► channel established │
+ └───────────────────────┘                    └───────────────────────┘
+        │                                              │
+        └──── FilePath ops, process launch, log ───────┘
+             streaming all travel the remoting channel</pre>
+<figcaption>Figure 13.2 — The remoting channel carries file operations, process launches and log streaming.</figcaption></figure>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Inbound (JNLP) agent — for agents that can't be reached inbound</span><button class="copy">📋 Copy</button></div><pre><code># On the agent: download the launcher and connect out to the controller
+curl -sSLO http://&lt;jenkins&gt;:8080/jnlpJars/agent.jar
+java -jar agent.jar \
+  -url http://&lt;jenkins&gt;:8080/ \
+  -secret &lt;SECRET_FROM_NODE_PAGE&gt; \
+  -name linux-2 \
+  -workDir /home/jenkins/agent &amp;
+
+# As a systemd unit so it survives reboots:
+sudo tee /etc/systemd/system/jenkins-agent.service &gt;/dev/null &lt;&lt;'UNIT'
+[Unit]
+Description=Jenkins Inbound Agent
+After=network.target
+[Service]
+User=jenkins
+ExecStart=/usr/bin/java -jar /opt/agent/agent.jar -url http://&lt;jenkins&gt;:8080/ -secret &lt;SECRET&gt; -name linux-2 -workDir /home/jenkins/agent
+Restart=always
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl enable --now jenkins-agent</code></pre></div>
+
+<h3><span class="hn">13.11</span> Tool installers vs baked images</h3>
+<div class="tw"><table>
+<thead><tr><th>Approach</th><th>Pros</th><th>Cons</th><th>Choose when</th></tr></thead>
+<tbody>
+<tr><td><strong>Auto-installer</strong> (<code>tools{}</code>)</td><td>Zero agent prep; version controlled in the pipeline</td><td>Downloads on cold agents; slower first build</td><td>Small teams, few toolchains</td></tr>
+<tr><td><strong>Baked agent image</strong> (Packer/Ansible)</td><td>Fast, reproducible, no network at build time</td><td>You maintain the image</td><td>Scale, air-gapped, strict reproducibility</td></tr>
+<tr><td><strong>Docker agent</strong> (<code>agent { docker }</code>)</td><td>Exact toolchain per stage, zero host pollution</td><td>Needs Docker on the host; socket risk</td><td>Polyglot repos — our choice</td></tr>
+</tbody>
+</table></div>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Docker agent with a persistent cache mount and a sidecar network</span><button class="copy">📋 Copy</button></div><pre><code>stage('Integration tests') {
+    agent {
+        docker {
+            image 'node:20-alpine'
+            args  '-v /var/lib/jenkins/.npm:/root/.npm ' +
+                  '--network ci-net ' +                  // reach a sidecar by name
+                  '-e TZ=UTC'
+            reuseNode true
+        }
+    }
+    steps {
+        sh 'npm ci &amp;&amp; npm run test:integration'
+    }
+}</code></pre></div>
+
+<h3><span class="hn">13.12</span> Lab — capacity planning on one machine</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 13.1 · How many executors should this box have?</span>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Measure, then decide</span><button class="copy">📋 Copy</button></div><pre><code>nproc                                  # vCPUs
+free -g                                # RAM
+# Rule of thumb for build agents:
+#   executors ~= min(vCPU, floor(RAM_GB / 2))
+#   4 vCPU / 8 GB  -&gt; 4 executors (if builds are CPU bound, start with 2-3)
+# A controller needs ~1 GB + 1 GB per 100 jobs for the UI alone.</code></pre></div>
+Then deliberately over-subscribe: set 8 executors on a 2-CPU box, run 4 builds at once, and watch the queue and load average. You will feel why "more executors" is not automatically "faster".</div>
+
+<h3><span class="hn">13.13</span> Kubernetes agents (the scale answer)</h3>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Ephemeral pod agent — one pod per build, destroyed after</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent {
+        kubernetes {
+            label 'nodejs-agent'
+            defaultContainer 'node'
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: node
+    image: node:20-alpine
+    command: ['cat']
+    tty: true
+    resources:
+      requests: { cpu: "500m", memory: "1Gi" }
+      limits:   { cpu: "2",    memory: "2Gi" }
+  - name: dind
+    image: docker:24-dind
+    securityContext: { privileged: true }
+'''
+        }
+    }
+    stages {
+        stage('Test')  { steps { container('node') { sh 'npm ci &amp;&amp; npm test' } } }
+        stage('Build') { steps { container('dind') { sh 'docker build -t app:$GIT_SHA .' } } }
+    }
+}</code></pre></div>
+<div class="info"><span class="lbl"><span class="ic">💡</span>Why this matters at scale</span>
+Every build gets a clean, disposable environment — no workspace drift, no "someone installed something weird on agent 3". The cost is pod start-up latency (typically 5–20 s) and the need to cache dependencies in a PVC or registry.</div>
+
+<h3><span class="hn">13.14</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>SSH agent vs JNLP agent?</div><div class="a">SSH agents are launched by the controller, so the agent needs a reachable SSH server — simple and firewall-friendly if the controller can reach it. JNLP/inbound agents dial out to the controller, which is the right choice when the agent sits behind NAT or a firewall. Both carry the same remoting traffic.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>How many executors per agent?</div><div class="a">Roughly one per vCPU, bounded by RAM (≈2 GB per concurrent build for typical Node/Python work), and validated by watching load average and build duration. Over-subscribing makes every build slower and increases flakiness from resource contention.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>How do you keep agent toolchains consistent?</div><div class="a">I don't rely on whatever happens to be installed: either the pipeline declares <code>agent { docker { image 'node:20.17-alpine3.20' } }</code> so the toolchain is pinned per stage, or the agent image is built by Packer/Ansible and version-controlled. Ad-hoc installs on long-lived agents always drift.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>What happens to running builds when an agent dies?</div><div class="a">The remoting channel breaks, the build is marked as failed (or retried if you configured agent-loss retry conditions), and the queue reassigns waiting builds to another agent with the same label. With durable pipelines the state is preserved up to the last checkpoint.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q10</span>How would you autoscale Jenkins?</div><div class="a">Kubernetes agents (one pod per build) or a cloud plugin (EC2, Azure VM agents) that provisions on demand and terminates idle agents. I'd set idle-retention to a few minutes, cap the maximum instances to control cost, and keep one small always-on agent for fast feedback.</div></div>
+</div>
+</section>

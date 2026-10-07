@@ -1,0 +1,89 @@
+<section class="block" id="block-0" data-title="Start here">
+    <div class="bhead"><div class="bnum">◆</div><div>
+      <div class="bl">Block 0 · Orientation</div>
+      <h2>Start here — how to use this playbook</h2>
+    </div></div>
+
+    <p>This is not a cheat sheet you skim. It is a <strong>build order</strong>. Each block adds exactly one new idea, hands you the code for both apps, and makes you run it before moving on. Miss a block and the next one feels like magic; follow the order and nothing is magic.</p>
+
+    <div class="grid3">
+      <div class="card"><h5>🧱 Blocks 1–6</h5><p>Foundation: install, pipeline syntax, Git, build, test. You become <em>usable</em>.</p></div>
+      <div class="card"><h5>⚙️ Blocks 7–15</h5><p>Real engineering: secrets, Docker, webhooks, RBAC, agents, shared libraries, multibranch. You become <em>hireable</em>.</p></div>
+      <div class="card"><h5>🛡️ Blocks 16–24</h5><p>DevSecOps, deploy, scale, troubleshoot, interview kit. You become <em>expensive</em>.</p></div>
+    </div>
+
+    <h3><span class="hn">0.1</span> The repo you cloned</h3>
+    <div class="code" data-lang="text"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="fn">jenkins-zero-to-hero/</span><button class="copy">📋 Copy</button></div><pre><code>jenkins-zero-to-hero/
+├── docs/jenkins-complete-guide.html   ← this document (the single source of truth)
+│
+├── nodejs-app/                        ← Express REST API · Node 20
+│   ├── src/{app.js,server.js,routes/items.js}
+│   ├── tests/app.test.js              ← Jest + Supertest (8 tests)
+│   ├── Dockerfile                     ← multi-stage · non-root · HEALTHCHECK
+│   ├── Jenkinsfile                    ← grows v1 → v20 with every block
+│   └── sonar-project.properties
+│
+├── python-app/                        ← Flask REST API · Python 3.12
+│   ├── app.py
+│   ├── tests/test_app.py              ← pytest + coverage (8 tests)
+│   ├── Dockerfile                     ← venv multi-stage · gunicorn · non-root
+│   ├── Jenkinsfile                    ← grows in parallel with the Node one
+│   └── sonar-project.properties
+│
+├── jenkins/
+│   ├── ec2-install.sh                 ← one-shot Jenkins + Docker install
+│   ├── plugins.txt                    ← curated plugin list (grows per block)
+│   ├── shared-library/                ← Block 14: vars/*.groovy
+│   ├── sonarqube/docker-compose.yml   ← Block 16: SAST server
+│   └── deploy/docker-compose.yml      ← Block 19: deploy target
+│
+└── scripts/</code></pre></div>
+
+    <div class="info"><span class="lbl"><span class="ic">💡</span>Why two apps?</span>
+    Because in real teams you never own just one stack. Every Jenkins concept here is shown <strong>twice</strong> — the npm way and the pip way. By Block 12 you'll notice you're no longer copying syntax, you're translating ideas. That's the skill that gets paid.
+    </div>
+
+    <h3 id="start-map"><span class="hn">0.2</span> The 24 blocks</h3>
+    <div class="tw"><table class="road">
+      <thead><tr><th>#</th><th>Block</th><th>What you'll be able to do after it</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><a href="#block-1">Install Jenkins on EC2 &amp; master the UI</a></td><td>Bring up a controller, name every menu</td></tr>
+        <tr><td>2</td><td><a href="#block-2">Declarative Pipeline anatomy</a></td><td>Write <code>agent → stages → steps → post</code> from memory</td></tr>
+        <tr><td>3</td><td><a href="#block-3">Snippet Generator &amp; syntax tooling</a></td><td>Never memorise step syntax again</td></tr>
+        <tr><td>4</td><td><a href="#block-4">Git + GitHub integration</a></td><td>Checkout code with SSH keys and PATs</td></tr>
+        <tr><td>5</td><td><a href="#block-5">BUILD stage — Node &amp; Python</a></td><td>Install deps deterministically, cache, package</td></tr>
+        <tr><td>6</td><td><a href="#block-6">TEST stage + reports</a></td><td>JUnit XML, coverage, fail on quality gates</td></tr>
+        <tr><td>7</td><td><a href="#block-7">Environment variables &amp; parameters</a></td><td><code>environment{}</code>, <code>params{}</code>, <code>withEnv</code></td></tr>
+        <tr><td>8</td><td><a href="#block-8">Credentials &amp; secrets</a></td><td>Credentials store, masking, <code>withCredentials</code></td></tr>
+        <tr><td>9</td><td><a href="#block-9">Docker build &amp; push</a></td><td>Image build, tag strategy, Docker Hub login</td></tr>
+        <tr><td>10</td><td><a href="#block-10">Webhooks &amp; triggers</a></td><td>Push to GitHub → build starts in seconds</td></tr>
+        <tr><td>11</td><td><a href="#block-11"><code>post{}</code> mastery</a></td><td>always/failure/unstable/cleanup + notifications</td></tr>
+        <tr><td>12</td><td><a href="#block-12">RBAC, users &amp; permissions</a></td><td>Role Strategy, matrix auth, least privilege</td></tr>
+        <tr><td>13</td><td><a href="#block-13">Nodes, agents, labels &amp; tools</a></td><td>SSH agents, Docker agents, tool installers</td></tr>
+        <tr><td>14</td><td><a href="#block-14">Shared Libraries</a></td><td>Reusable <code>vars/</code> across both apps</td></tr>
+        <tr><td>15</td><td><a href="#block-15">Multibranch Pipelines</a></td><td>Branch &amp; PR discovery, per-branch Jenkinsfile</td></tr>
+        <tr><td>16</td><td><a href="#block-16">DevSecOps · SAST (SonarQube)</a></td><td>Quality gate that blocks bad code</td></tr>
+        <tr><td>17</td><td><a href="#block-17">DevSecOps · SCA &amp; secrets</a></td><td>npm audit, pip-audit, Bandit, Dependency-Check</td></tr>
+        <tr><td>18</td><td><a href="#block-18">DevSecOps · container &amp; DAST</a></td><td>Trivy, SBOM, image signing, OWASP ZAP</td></tr>
+        <tr><td>19</td><td><a href="#block-19">Deploy stages</a></td><td>Ship the image with SSH + Compose</td></tr>
+        <tr><td>20</td><td><a href="#block-20">Notifications &amp; approvals</a></td><td>Slack, email, human-in-the-loop gates</td></tr>
+        <tr><td>21</td><td><a href="#block-21">Parallel, matrix, timeout, retry, lock</a></td><td>Fast, resilient pipelines</td></tr>
+        <tr><td>22</td><td><a href="#block-22">Backup, upgrade &amp; maintenance</a></td><td>Keep a production controller healthy</td></tr>
+        <tr><td>23</td><td><a href="#block-23">Troubleshooting playbook</a></td><td>Fix the 25 errors that always happen</td></tr>
+        <tr><td>24</td><td><a href="#block-24">Interview kit · 70 Q&amp;A + scenarios</a></td><td>Crack the 10 LPA+ round</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">0.3</span> How to study (this matters more than the reading)</h3>
+    <ol class="steps">
+      <li><strong>Read one block. Then do it.</strong> Every block ends with a checklist. If you can't tick it, you haven't finished the block.</li>
+      <li><strong>Type, don't blindly paste.</strong> The copy button saves your fingers, not your brain. Change something — a stage name, an image tag — and see what breaks.</li>
+      <li><strong>Break it on purpose.</strong> Remove the credentials ID, use a bad branch name, forget <code>sh</code>. The error tables are written from failures you should cause yourself at least once.</li>
+      <li><strong>Use <em>Replay</em>.</strong> Job page → Replay → edit → Run. Iterate in seconds without polluting Git history. Commit only when green.</li>
+      <li><strong>Do it twice.</strong> Once for Node, once for Python. That repetition is the difference between "I followed a tutorial" and "I can do this for your repo".</li>
+    </ol>
+
+    <div class="tip"><span class="lbl"><span class="ic">🎯</span>Your target stack (used in every block)</span>
+    <span class="chip">☁️ AWS EC2 Ubuntu 24.04</span><span class="chip">☕ Jenkins LTS on Java 21</span><span class="chip">🐙 GitHub + webhooks</span><span class="chip">🐳 Docker Hub</span><span class="chip">🟩 Node 20 · Express · Jest</span><span class="chip">🐍 Python 3.12 · Flask · pytest</span><span class="chip">🛡️ Trivy · SonarQube · OWASP</span>
+    </div>
+  </section>

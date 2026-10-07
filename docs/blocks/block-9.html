@@ -1,0 +1,415 @@
+<section class="block" id="block-9" data-block="9" data-title="Docker build &amp; push">
+    <div class="bhead"><div class="bnum">09</div><div>
+      <div class="bl">Block 9 · Real engineering</div>
+      <h2>Docker build &amp; push to Docker Hub</h2>
+      <p class="bgoal"><b>Goal:</b> turn tested code into a versioned, immutable container image in a registry — the artifact every modern deployment consumes.</p>
+    </div></div>
+
+    <h3><span class="hn">9.1</span> Concepts: image, tag, registry, digest</h3>
+    <div class="grid2">
+      <div class="card"><h5>🏷️ Tag</h5><p>A mutable pointer to an image: <code>myapp:1.4.2</code>. <code>latest</code> is a tag, not magic — and a dangerous one in production.</p></div>
+      <div class="card"><h5>🔒 Digest</h5><p>Immutable content hash: <code>myapp@sha256:9f…</code>. What you actually deploy when you need reproducibility.</p></div>
+      <div class="card"><h5>📦 Registry</h5><p>Storage + API: Docker Hub, ECR, GHCR, Harbor. Jenkins authenticates, then pushes layers.</p></div>
+      <div class="card"><h5>🧱 Layer</h5><p>Each Dockerfile instruction = a layer. Layers are cached, which is why instruction <em>order</em> decides build speed.</p></div>
+    </div>
+
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Install the plugin + give Jenkins docker access</span><button class="copy">📋 Copy</button></div><pre><code># Plugins: "Docker Pipeline" (docker-workflow) + "Docker Commons" (docker-commons)
+#   Manage Jenkins -> Plugins -> Available -> Docker Pipeline
+
+# On the EC2 box (already done by ec2-install.sh step 6/7):
+sudo usermod -aG docker jenkins
+sudo systemctl restart jenkins
+
+# Verify from Jenkins' point of view:
+sudo -iu jenkins docker info
+sudo -iu jenkins docker run --rm hello-world</code></pre></div>
+
+    <h3><span class="hn">9.2</span> A tagging strategy that won't bite you</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Tag</th><th>Example</th><th>Purpose</th><th>Good practice?</th></tr></thead>
+      <tbody>
+        <tr><td>Build number</td><td><code>nodejs-app:42</code></td><td>Traceable back to a Jenkins build</td><td>✅</td></tr>
+        <tr><td>Git SHA</td><td><code>nodejs-app:1a2b3c4</code></td><td>Traceable back to exact code</td><td>✅ best</td></tr>
+        <tr><td>Semantic version</td><td><code>nodejs-app:1.4.2</code></td><td>Human releases</td><td>✅</td></tr>
+        <tr><td><code>latest</code></td><td><code>nodejs-app:latest</code></td><td>Convenience for dev only</td><td>⚠️ never deploy from it</td></tr>
+        <tr><td>Mutable env tag</td><td><code>nodejs-app:prod</code></td><td>Quick rollback pointer</td><td>⚠️ only with a digest recorded</td></tr>
+      </tbody>
+    </table></div>
+    <div class="tip"><span class="lbl"><span class="ic">🏆</span>The pattern I use</span>
+    Push <strong>three</strong> tags per build: the immutable <code>&lt;git-sha&gt;</code> (what you deploy), <code>&lt;build-number&gt;</code> (traceable to CI), and <code>latest</code> (dev convenience only). Deployments always reference the SHA or digest, so "what is running in prod?" is never a guess.</div>
+
+    <h3><span class="hn">9.3</span> Two ways to build &amp; push</h3>
+    <div class="tabs">
+      <div class="tabbar">
+        <button class="tab on" data-t="d1">A. docker.build + withRegistry (recommended)</button>
+        <button class="tab" data-t="d2">B. plain shell commands</button>
+      </div>
+      <div class="tabpane on" data-t="d1">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Docker Pipeline DSL — handles login/logout for you</span><button class="copy">📋 Copy</button></div><pre><code>stage('Docker Build &amp; Push') {
+    steps {
+        script {
+            def imageName = "docker.io/${DOCKER_USER}/nodejs-app"     // no tag here
+            def app = docker.build("${imageName}:${env.GIT_SHA}", "--pull --no-cache .")
+
+            docker.withRegistry('https://index.docker.io/v1/', 'dockerhub-creds') {
+                app.push()                       // pushes :&lt;git-sha>
+                app.push(env.BUILD_NUMBER)       // pushes :&lt;build-number>
+                if (env.BRANCH_NAME == 'main') {
+                    app.push('latest')           // only main moves :latest
+                }
+            }
+            env.IMAGE_DIGEST = sh(script: "docker inspect --format='{{index .RepoDigests 0}}' ${imageName}:${env.GIT_SHA}",
+                                  returnStdout: true).trim()
+            echo "Pushed ${env.IMAGE_DIGEST}"
+        }
+    }
+}</code></pre></div>
+      </div>
+      <div class="tabpane" data-t="d2">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Full control — useful when you need buildx, secrets or --cache-from</span><button class="copy">📋 Copy</button></div><pre><code>stage('Docker Build &amp; Push') {
+    steps {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
+                                          usernameVariable: 'REG_USER',
+                                          passwordVariable: 'REG_PASS')]) {
+            sh '''
+                set -e
+                echo "$REG_PASS" | docker login -u "$REG_USER" --password-stdin
+
+                docker build \
+                  --pull \
+                  --build-arg BUILD_ENV=ci \
+                  --tag $IMAGE:$GIT_SHA \
+                  --tag $IMAGE:$BUILD_NUMBER \
+                  .
+
+                docker push $IMAGE:$GIT_SHA
+                docker push $IMAGE:$BUILD_NUMBER
+                docker logout
+            '''
+        }
+    }
+}</code></pre></div>
+      </div>
+    </div>
+
+    <h3><span class="hn">9.4</span> Faster, smaller, safer images</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Technique</th><th>How</th><th>Gain</th></tr></thead>
+      <tbody>
+        <tr><td>Correct layer order</td><td>Copy <code>package*.json</code> / <code>requirements.txt</code> first, install, <em>then</em> copy source</td><td>Dependency layers stay cached across code changes</td></tr>
+        <tr><td><span class="path">.dockerignore</span></td><td>Exclude <code>node_modules</code>, <code>.git</code>, <code>coverage</code></td><td>Smaller context, faster builds, no secret leakage</td></tr>
+        <tr><td>Multi-stage build</td><td>Build in one stage, ship a slim runtime stage</td><td>Images 5–10× smaller, fewer CVEs</td></tr>
+        <tr><td>Non-root user</td><td><code>USER appuser</code></td><td>Passes CIS benchmark &amp; Trivy checks (Block 18)</td></tr>
+        <tr><td><code>--pull</code></td><td>Always refresh base images</td><td>Picks up upstream security patches</td></tr>
+        <tr><td><code>--cache-from</code></td><td>Pull the previous image and use its layers</td><td>Big speed-up on ephemeral agents</td></tr>
+        <tr><td>Pin base images</td><td><code>FROM node:20.17-alpine3.20</code></td><td>Reproducible builds, no surprise breakage</td></tr>
+      </tbody>
+    </table></div>
+
+    <div class="dang"><span class="lbl"><span class="ic">🚨</span>Security reality: mounting <span class="path">/var/run/docker.sock</span></span>
+    Our learning setup gives the <code>jenkins</code> user access to the host Docker socket. That is <strong>root-equivalent</strong> — any job, and anyone who can create one, can own the host. Production alternatives:
+    <ul style="margin:8px 0 0;padding-left:20px">
+      <li><strong>Kaniko / Buildah</strong> — build images in userspace without a docker daemon.</li>
+      <li><strong>Rootless BuildKit</strong> — a daemon that runs unprivileged.</li>
+      <li><strong>Docker-in-Docker (dind)</strong> — a real daemon in a container; still privileged, but isolated from the host.</li>
+      <li><strong>Ephemeral cloud agents</strong> — a fresh VM per build, destroyed afterwards.</li>
+    </ul>Say this in interviews: it shows you understand the risk, not just the syntax.</div>
+
+    <h3><span class="hn">9.5</span> Smoke-test the image before you push it</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Run the container, hit /health, then tear it down</span><button class="copy">📋 Copy</button></div><pre><code>stage('Container smoke test') {
+    steps {
+        script {
+            def img = docker.build("${IMAGE}:${env.GIT_SHA}", '.')
+            img.inside("--rm -p ${3000 + env.EXECUTOR_NUMBER.toInteger()}:3000".toString() + ' -e PORT=3000') {
+                // 'inside' runs the container, mounts the workspace, waits for health
+                retry(10) {
+                    sleep 3
+                    sh "curl -fsS http://localhost:${3000 + env.EXECUTOR_NUMBER.toInteger()}/health"
+                }
+            }
+        }
+    }
+}</code></pre></div>
+    <div class="note"><span class="lbl"><span class="ic">💡</span>Why the port maths?</span>
+    <code>env.EXECUTOR_NUMBER</code> gives each concurrent build a different port, so two builds running at once don't fight over <code>3000</code>. That detail alone prevents a whole class of "it fails when two people push" bugs.</div>
+
+    <h3><span class="hn">9.6</span> ✍️ Jenkinsfiles v9 — build &amp; push</h3>
+    <div class="tabs">
+      <div class="tabbar">
+        <button class="tab on" data-t="n9">🟩 nodejs-app/Jenkinsfile</button>
+        <button class="tab" data-t="p9">🐍 python-app/Jenkinsfile</button>
+      </div>
+      <div class="tabpane on" data-t="n9">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">nodejs-app/Jenkinsfile — v9</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+    options { timestamps(); timeout(time: 30, unit: 'MINUTES'); disableConcurrentBuilds() }
+
+    environment {
+        APP_NAME    = 'nodejs-app'
+        DOCKER_USER = '&lt;your-dockerhub-user&gt;'
+        IMAGE       = "${DOCKER_USER}/${APP_NAME}"
+        REGISTRY    = 'https://index.docker.io/v1/'
+        CREDS       = 'dockerhub-creds'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                dir(APP_NAME) { checkout scmGit(branches: [[name: '*/main']],
+                        extensions: [cleanBeforeCheckout()],
+                        userRemoteConfigs: [[credentialsId: 'github-ssh',
+                            url: 'git@github.com:&lt;you&gt;/jenkins-zero-to-hero.git']]) }
+                script {
+                    dir(APP_NAME) {
+                        env.GIT_SHA = sh(script:'git rev-parse --short HEAD', returnStdout:true).trim()
+                    }
+                }
+            }
+        }
+        stage('Build')  { steps { dir(APP_NAME) { sh 'npm ci' } } }
+        stage('Test')   { steps { dir(APP_NAME) { sh 'npm run test:junit' } } }
+
+        stage('Docker Build') {
+            steps {
+                dir(APP_NAME) {
+                    script {
+                        app = docker.build("${IMAGE}:${env.GIT_SHA}", "--pull .")
+                    }
+                }
+            }
+        }
+
+        stage('Container Smoke Test') {
+            steps {
+                script {
+                    app.inside('-p 3100:3000 -e PORT=3000') {
+                        retry(10) {
+                            sleep 3
+                            sh 'curl -fsS http://localhost:3100/health || exit 1'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Push') {
+            when { branch 'main' }
+            steps {
+                script {
+                    docker.withRegistry(env.REGISTRY, env.CREDS) {
+                        app.push(env.GIT_SHA)
+                        app.push(env.BUILD_NUMBER)
+                        app.push('latest')
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            dir(APP_NAME) { junit testResults: 'reports/junit.xml', allowEmptyResults: true }
+            sh 'docker image prune -f || true'
+        }
+        success { echo "✅ Pushed ${IMAGE}:${env.GIT_SHA}" }
+    }
+}</code></pre></div>
+      </div>
+      <div class="tabpane" data-t="p9">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">python-app/Jenkinsfile — v9</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+    options { timestamps(); timeout(time: 30, unit: 'MINUTES'); disableConcurrentBuilds() }
+
+    environment {
+        APP_NAME    = 'python-app'
+        DOCKER_USER = '&lt;your-dockerhub-user&gt;'
+        IMAGE       = "${DOCKER_USER}/${APP_NAME}"
+        REGISTRY    = 'https://index.docker.io/v1/'
+        CREDS       = 'dockerhub-creds'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                dir(APP_NAME) { checkout scmGit(branches: [[name: '*/main']],
+                        extensions: [cleanBeforeCheckout()],
+                        userRemoteConfigs: [[credentialsId: 'github-ssh',
+                            url: 'git@github.com:&lt;you&gt;/jenkins-zero-to-hero.git']]) }
+                script {
+                    dir(APP_NAME) {
+                        env.GIT_SHA = sh(script:'git rev-parse --short HEAD', returnStdout:true).trim()
+                    }
+                }
+            }
+        }
+        stage('Build')  { steps { dir(APP_NAME) { sh '''
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install -r requirements-dev.txt
+                ''' } } }
+        stage('Test')   { steps { dir(APP_NAME) { sh '. venv/bin/activate &amp;&amp; pytest --cov-fail-under=70' } } }
+
+        stage('Docker Build') {
+            steps {
+                dir(APP_NAME) { script { app = docker.build("${IMAGE}:${env.GIT_SHA}", "--pull .") } }
+            }
+        }
+
+        stage('Container Smoke Test') {
+            steps {
+                script {
+                    app.inside('-p 5100:5000 -e PORT=5000') {
+                        retry(10) {
+                            sleep 3
+                            sh 'curl -fsS http://localhost:5100/health || exit 1'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Push') {
+            when { branch 'main' }
+            steps {
+                script {
+                    docker.withRegistry(env.REGISTRY, env.CREDS) {
+                        app.push(env.GIT_SHA)
+                        app.push(env.BUILD_NUMBER)
+                        app.push('latest')
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            dir(APP_NAME) { junit testResults: 'reports/junit.xml', allowEmptyResults: true }
+            sh 'docker image prune -f || true'
+        }
+        success { echo "✅ Pushed ${IMAGE}:${env.GIT_SHA}" }
+    }
+}</code></pre></div>
+      </div>
+    </div>
+
+    <h3><span class="hn">9.7</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>"Docker Pipeline" plugin installed; <code>sudo -u jenkins docker info</code> works.</li>
+      <li>Both pipelines produce an image tagged with the Git SHA and push three tags.</li>
+      <li>I can see the image on hub.docker.com with the correct tags.</li>
+      <li>I pulled the pushed image on another machine and hit <code>/health</code> successfully.</li>
+      <li>I can explain why <code>latest</code> must not be used for production deploys.</li>
+    </ul>
+
+    <h3><span class="hn">9.8</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>How does Jenkins build and push a Docker image?</div><div class="a">With the Docker Pipeline plugin: <code>docker.build("image:tag", "--pull .")</code> creates the image and <code>docker.withRegistry(url, credentialsId) { img.push() }</code> authenticates and pushes. Credentials come from the Jenkins store, so no password ever appears in the pipeline or logs.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>What's your image tagging strategy?</div><div class="a">Immutable Git SHA as the primary tag, plus the build number for traceability to CI, and <code>latest</code> for developer convenience only. Deploys always reference the SHA or the digest so the running artifact is unambiguous and rollback is trivial.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>Is giving Jenkins access to the Docker socket safe?</div><div class="a">No — socket access is effectively root on the host, so any job (and anyone who can create one) could take over the machine. For production I'd use Kaniko or rootless BuildKit to build without a privileged daemon, or run each build on an ephemeral agent that is destroyed afterwards.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>How do you keep Docker builds fast?</div><div class="a">Order Dockerfile instructions so dependency layers change least often, keep a proper <code>.dockerignore</code>, reuse the previous image's layers with <code>--cache-from</code>, and use multi-stage builds so the pushed image contains only what it needs to run.</div></div>
+    </div>
+
+    <h3><span class="hn">9.9</span> 🔥 Common errors</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Error</th><th>Cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><code>docker: command not found</code></td><td>Docker not installed, or not on PATH for the jenkins user</td><td>Install docker-ce; verify with <code>sudo -iu jenkins docker -v</code></td></tr>
+        <tr><td><code>Cannot connect to the Docker daemon</code></td><td>jenkins not in the docker group / daemon stopped</td><td><code>usermod -aG docker jenkins</code> + restart both services</td></tr>
+        <tr><td><code>denied: requested access to the resource is denied</code></td><td>Wrong repo name, not logged in, or token lacks write scope</td><td>Check <code>DOCKER_USER</code> matches your namespace; re-login with an access token</td></tr>
+        <tr><td><code>docker build</code> hangs on <code>apt-get</code></td><td>No network from the build context / DNS</td><td>Pass <code>--network=host</code>, or fix the agent's DNS</td></tr>
+        <tr><td>Image works locally, crashes in CI</td><td>Architecture mismatch (arm64 vs amd64)</td><td>Build for the target platform: <code>docker buildx build --platform linux/amd64</code></td></tr>
+      </tbody>
+    </table></div>
+
+<h3><span class="hn">9.10</span> Under the hood — layers, cache and the build context</h3>
+<p>Every Dockerfile instruction creates a layer identified by a content hash. Docker reuses a cached layer when the instruction <em>and its inputs</em> are unchanged — which is why instruction order dominates build time.</p>
+<figure><pre class="ascii">
+  COPY package*.json ./        ─┐
+  RUN  npm ci                   │ cached: only changes when the manifest changes
+                               ─┘
+  COPY src ./src               ─┐
+  RUN  npm run build            │ rebuilt on every source edit (as it should be)
+                               ─┘
+        ▲
+        └── the "dependency layer boundary": put it as high as possible</pre>
+<figcaption>Figure 9.1 — Ordering the Dockerfile so the expensive, rarely-changing layer stays cached.</figcaption></figure>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Inspect what your image is really made of</span><button class="copy">📋 Copy</button></div><pre><code>docker history user/nodejs-app:abc1234          # layer list + sizes
+docker images --format '{{.Repository}}:{{.Tag}}	{{.Size}}'
+docker inspect user/nodejs-app:abc1234 --format '{{.Id}} {{.RepoTags}} {{index .RepoDigests 0}}'
+docker scout quickview user/nodejs-app:abc1234  # (or) trivy image ...</code></pre></div>
+<div class="warn"><span class="lbl"><span class="ic">⚠️</span>The build context trap</span>
+<code>docker build .</code> sends the <em>entire</em> directory to the daemon — including <code>.git</code>, <code>node_modules</code> and <code>coverage</code> unless you have a <span class="path">.dockerignore</span>. A 500 MB context can add minutes to every build and, worse, can leak files into image layers.</div>
+
+<h3><span class="hn">9.11</span> Multi-stage, distroless and size</h3>
+<div class="tw"><table>
+<thead><tr><th>Base image</th><th>Typical size</th><th>When</th></tr></thead>
+<tbody>
+<tr><td><code>node:20</code></td><td>~1.1 GB</td><td>Almost never in production</td></tr>
+<tr><td><code>node:20-slim</code></td><td>~240 MB</td><td>Good default</td></tr>
+<tr><td><code>node:20-alpine</code></td><td>~180 MB</td><td>Smallest; watch for musl/glibc edge cases</td></tr>
+<tr><td><code>gcr.io/distroless/nodejs20</code></td><td>~120 MB</td><td>No shell, no package manager — smallest attack surface</td></tr>
+<tr><td><code>python:3.12-slim</code></td><td>~150 MB</td><td>Our Python default (multi-stage with a venv)</td></tr>
+</tbody>
+</table></div>
+<div class="code" data-lang="dockerfile"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">dockerfile</span><span class="fn">Distroless runtime stage — no shell, no package manager, tiny surface</span><button class="copy">📋 Copy</button></div><pre><code># ---- build stage ----
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build &amp;&amp; npm prune --omit=dev
+
+# ---- runtime stage ----
+FROM gcr.io/distroless/nodejs20-debian12:nonroot
+WORKDIR /app
+ENV NODE_ENV=production PORT=3000
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+USER nonroot
+EXPOSE 3000
+CMD ["dist/server.js"]</code></pre></div>
+<div class="info"><span class="lbl"><span class="ic">💡</span>Trade-off to mention in interviews</span>
+Distroless images have <strong>no shell</strong>, so you cannot <code>docker exec</code> into them to debug and <code>HEALTHCHECK CMD</code> with shell syntax won't work. Teams that adopt them usually pair them with good observability (metrics, traces, structured logs) because live debugging inside the container is no longer an option.</div>
+
+<h3><span class="hn">9.12</span> Lab — a failing image, diagnosed properly</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 9.1 · Build succeeds, container exits immediately</span>
+<strong>Symptom:</strong> <code>docker build</code> is green; the container exits with code 1 and no useful log.
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Diagnose in this order</span><button class="copy">📋 Copy</button></div><pre><code>docker run --rm user/nodejs-app:abc1234          # read the error
+docker logs $(docker ps -lq)                     # logs of the last container
+
+# 1) Is the entrypoint even present?
+docker run --rm --entrypoint sh user/nodejs-app:abc1234 -c 'ls -la /app'
+
+# 2) Is it a permissions problem? (non-root user can't read a file)
+docker run --rm user/nodejs-app:abc1234 id
+docker run --rm --entrypoint sh user/nodejs-app:abc1234 -c 'ls -la /app/node_modules | head'
+
+# 3) Is the port/env wrong?
+docker run --rm -e PORT=3000 -p 3000:3000 user/nodejs-app:abc1234
+
+# 4) Does it start at all when you override the command?
+docker run --rm -it --entrypoint sh user/nodejs-app:abc1234</code></pre></div>
+<strong>Most common causes:</strong> app listens on <code>127.0.0.1</code> instead of <code>0.0.0.0</code> (unreachable from outside the container); <code>USER</code> can't read a file copied as root; missing <code>NODE_ENV</code> or <code>PORT</code>; distroless image with a shell-form <code>CMD</code>.</div>
+
+<h3><span class="hn">9.13</span> Registry reference</h3>
+<div class="tw"><table>
+<thead><tr><th>Registry</th><th><code>withRegistry</code> URL</th><th>Auth</th></tr></thead>
+<tbody>
+<tr><td>Docker Hub</td><td><code>https://index.docker.io/v1/</code></td><td>Username + access token</td></tr>
+<tr><td>GitHub (GHCR)</td><td><code>https://ghcr.io</code></td><td>Username + PAT (<code>write:packages</code>)</td></tr>
+<tr><td>AWS ECR</td><td><code>https://&lt;acct&gt;.dkr.ecr.&lt;region&gt;.amazonaws.com</code></td><td><code>ecr:region</code> credential, or IAM on the agent</td></tr>
+<tr><td>GitLab</td><td><code>https://registry.gitlab.com</code></td><td>Deploy token / CI job token</td></tr>
+<tr><td>Self-hosted Harbor</td><td><code>https://harbor.example.com</code></td><td>Robot account</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">9.14</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q5</span>Why does my Docker build take 10 minutes when nothing changed?</div><div class="a">Almost always cache invalidation: the manifest is copied after the source, so <code>npm ci</code> re-runs every time; or <code>--no-cache</code>/<code>--pull</code> is forced; or the build context is huge. I check <code>docker history</code>, move the dependency layer up, and add a <span class="path">.dockerignore</span>.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q6</span>How do you get a reproducible image?</div><div class="a">Pin the base image by tag and ideally digest (<code>FROM node:20.17-alpine3.20@sha256:…</code>), install from a lockfile, avoid <code>latest</code>, and set a fixed build environment. Then reference the pushed image by digest in deployments.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>What is a dangling image, and why does my disk fill up?</div><div class="a">A dangling image is a layer set no longer referenced by any tag — every rebuild leaves some. Prune them on a schedule (<code>docker image prune -f</code>) and cap build history; on a busy CI host this is the single biggest disk consumer.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>Multi-arch builds in CI?</div><div class="a">With buildx: <code>docker buildx build --platform linux/amd64,linux/arm64 -t img:tag --push</code>. It needs QEMU emulation (slow) or native builders (fast). I'd run amd64 on every commit and the full multi-arch manifest on release branches only.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>How do you pass secrets into a build without leaking them into layers?</div><div class="a">Use BuildKit secret mounts: <code>RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci</code> with <code>--secret id=npmrc,src=…</code>. Never <code>ARG SECRET</code> or <code>COPY</code> a secret — both persist in the image history.</div></div>
+</div>
+</section>

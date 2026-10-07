@@ -1,0 +1,9 @@
+# dev + test + security tooling (Block 6 & Block 17)
+# NOTE: JUnit XML comes from pytest's built-in --junitxml flag (see pytest.ini),
+#       so no extra plugin is needed.
+-r requirements.txt
+pytest==8.3.2
+pytest-cov==5.0.0
+flake8==7.1.1
+bandit==1.7.9
+pip-audit==2.7.3

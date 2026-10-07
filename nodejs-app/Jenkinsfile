@@ -1,0 +1,301 @@
+// ============================================================================
+//  nodejs-app/Jenkinsfile  --  FINAL (v20)
+//  Built block by block in docs/jenkins-complete-guide.html
+//
+//  Checkout -> Build -> (parallel: lint, secrets, SCA) -> Test -> SAST ->
+//  Docker build -> container smoke test -> image scan -> SBOM -> push ->
+//  deploy staging -> approval -> deploy prod -> post/notify/cleanup
+//
+//  Requires credentials:  github-ssh, dockerhub-creds, sonar-token, deploy-key
+//  Requires plugins:      Pipeline, Git, Docker Pipeline, SonarQube Scanner,
+//                         JUnit, Coverage, Warnings NG, Timestamper, AnsiColor,
+//                         Workspace Cleanup, Slack Notification, Lockable Resources
+//  Agents: label 'linux' (git, trivy, gitleaks) and label 'docker' (docker socket)
+// ============================================================================
+pipeline {
+
+    agent none                                   // Block 13: per-stage agents
+
+    options {
+        timestamps()                             // Block 3
+        ansiColor('xterm')
+        timeout(time: 45, unit: 'MINUTES')       // Block 21
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '50', artifactNumToKeepStr: '10'))  // Block 22
+        skipDefaultCheckout(true)                // we check out explicitly, once
+    }
+
+    parameters {                                 // Block 7
+        choice       name: 'DEPLOY_ENV',  choices: ['none', 'staging', 'prod'], description: 'Deploy target'
+        booleanParam name: 'RUN_SCANS',   defaultValue: true,  description: 'Run security scans'
+        booleanParam name: 'PUSH_IMAGE',  defaultValue: true,  description: 'Push image to Docker Hub'
+    }
+
+    triggers {                                   // Block 10
+        pollSCM('H/10 * * * *')                  // fallback; primary trigger is the GitHub webhook
+        cron('H 3 * * *')                        // nightly full run
+    }
+
+    environment {                                // Block 7
+        APP_NAME           = 'nodejs-app'
+        APP_PORT           = '3000'
+        DOCKER_USER        = 'REPLACE_ME'        // <-- your Docker Hub namespace
+        IMAGE              = "${DOCKER_USER}/${APP_NAME}"
+        REGISTRY           = 'https://index.docker.io/v1/'
+        REGISTRY_CREDS     = 'dockerhub-creds'   // Block 8: credential ID only, never the secret
+        npm_config_cache   = '/var/lib/jenkins/.npm'   // cached OUTSIDE the workspace (Block 5)
+        SONAR_PROJECT_KEY  = 'nodejs-app'
+    }
+
+    stages {
+
+        // ------------------------------------------------------------------
+        stage('Checkout') {                      // Block 4
+            agent { label 'linux' }
+            steps {
+                dir(APP_NAME) {
+                    checkout scm                 // Multibranch injects the right branch (Block 15)
+                }
+                script {
+                    dir(APP_NAME) {
+                        env.GIT_SHA    = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                        env.GIT_AUTHOR = sh(script: "git log -1 --pretty=format:'%an'", returnStdout: true).trim()
+                    }
+                    currentBuild.description = "${env.BRANCH_NAME ?: 'branch'} · ${env.GIT_SHA}"
+                    echo "Building ${APP_NAME} @ ${env.GIT_SHA} by ${env.GIT_AUTHOR}"
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        stage('Quality & Security') {            // Block 21 (parallel) + Block 17
+            when { expression { params.RUN_SCANS } }
+            failFast false
+            parallel {
+
+                stage('Build') {                 // Block 5
+                    agent { docker { image 'node:20-alpine'; args '-v /var/lib/jenkins/.npm:/root/.npm'; reuseNode true } }
+                    steps {
+                        dir(APP_NAME) {
+                            sh label: 'toolchain',   script: 'node -v && npm -v'
+                            sh label: 'npm ci',      script: 'npm ci'      // deterministic (never `npm install`)
+                        }
+                    }
+                }
+
+                stage('Lint') {                  // Block 17
+                    agent { docker { image 'node:20-alpine'; reuseNode true } }
+                    steps {
+                        dir(APP_NAME) {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') { sh 'npm run lint' }
+                        }
+                    }
+                }
+
+                stage('SCA · npm audit') {       // Block 17
+                    agent { docker { image 'node:20-alpine'; reuseNode true } }
+                    steps {
+                        dir(APP_NAME) {
+                            sh 'npm audit --audit-level=high --json > npm-audit.json || true'
+                            sh 'npm audit --audit-level=high'      // non-zero exit => blocking gate
+                        }
+                    }
+                    post { always { archiveArtifacts artifacts: 'nodejs-app/npm-audit.json', allowEmptyArchive: true } }
+                }
+
+                stage('Secrets · gitleaks') {    // Block 17
+                    agent { label 'linux' }
+                    steps { sh 'gitleaks detect --source . --redact' }
+                }
+            }
+        }
+
+        stage('Build (fallback)') {              // runs only when scans were skipped
+            when { not { expression { params.RUN_SCANS } } }
+            agent { docker { image 'node:20-alpine'; args '-v /var/lib/jenkins/.npm:/root/.npm'; reuseNode true } }
+            steps { dir(APP_NAME) { sh 'npm ci' } }
+        }
+
+        // ------------------------------------------------------------------
+        stage('Test') {                          // Block 6
+            agent { docker { image 'node:20-alpine'; args '-v /var/lib/jenkins/.npm:/root/.npm'; reuseNode true } }
+            steps {
+                dir(APP_NAME) {
+                    // coverageThreshold in package.json enforces the gate
+                    sh label: 'jest + coverage', script: 'npm run test:junit'
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        stage('SAST · SonarQube') {              // Block 16
+            agent { label 'linux' }
+            when { anyOf { branch 'main'; branch 'develop'; changeRequest() } }
+            steps {
+                dir(APP_NAME) {
+                    withSonarQubeEnv('sonar') { sh 'sonar-scanner' }
+                }
+            }
+        }
+
+        stage('Quality Gate') {                  // Block 16
+            agent { label 'linux' }
+            when { anyOf { branch 'main'; branch 'develop'; changeRequest() } }
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {          // needs /sonarqube-webhook/ configured
+                    script {
+                        def qg = waitForQualityGate()
+                        echo "Quality gate: ${qg.status}"
+                        if (qg.status != 'OK') { error "SonarQube quality gate failed: ${qg.status}" }
+                    }
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        stage('Docker Build') {                  // Block 9
+            agent { label 'docker' }
+            steps {
+                dir(APP_NAME) {
+                    script { app = docker.build("${IMAGE}:${env.GIT_SHA}", '--pull .') }
+                }
+            }
+        }
+
+        stage('Container Smoke Test') {          // Block 9
+            agent { label 'docker' }
+            steps {
+                script {
+                    def port = 3000 + env.EXECUTOR_NUMBER.toInteger()   // avoid clashes (Block 9)
+                    app.inside("-p ${port}:3000 -e PORT=3000") {
+                        retry(10) { sleep 3; sh "curl -fsS http://localhost:${port}/health || exit 1" }
+                    }
+                }
+            }
+        }
+
+        stage('Image Scan · Trivy') {            // Block 18
+            agent { label 'docker' }
+            when { expression { params.RUN_SCANS } }
+            steps {
+                sh "trivy image --format table --output trivy-image.txt --severity HIGH,CRITICAL ${IMAGE}:${env.GIT_SHA} || true"
+                sh "trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed ${IMAGE}:${env.GIT_SHA}"
+            }
+            post { always { archiveArtifacts artifacts: 'trivy-image.txt', allowEmptyArchive: true } }
+        }
+
+        stage('SBOM') {                          // Block 18
+            agent { label 'docker' }
+            steps {
+                sh "syft ${IMAGE}:${env.GIT_SHA} -o cyclonedx-json=sbom.cdx.json || trivy image --format cyclonedx --output sbom.cdx.json ${IMAGE}:${env.GIT_SHA}"
+                archiveArtifacts artifacts: 'sbom.cdx.json', fingerprint: true
+            }
+        }
+
+        // ------------------------------------------------------------------
+        stage('Push to Docker Hub') {            // Block 9
+            agent { label 'docker' }
+            when {
+                allOf {
+                    expression { params.PUSH_IMAGE }
+                    anyOf { branch 'main'; branch 'develop' }
+                }
+            }
+            steps {
+                script {
+                    docker.withRegistry(env.REGISTRY, env.REGISTRY_CREDS) {
+                        app.push(env.GIT_SHA)                       // immutable
+                        app.push(env.BUILD_NUMBER)                  // traceable to CI
+                        if (env.BRANCH_NAME == 'main') { app.push('latest') }
+                    }
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        stage('Deploy · staging') {              // Block 19
+            agent { label 'linux' }
+            when {
+                allOf { branch 'main'; expression { params.DEPLOY_ENV != 'none' } }
+            }
+            steps {
+                sshagent(credentials: ['deploy-key']) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ubuntu@staging.example.com '
+                            set -e
+                            cd /opt/${APP_NAME}
+                            export IMAGE_REPO=${IMAGE} IMAGE_TAG=${GIT_SHA}
+                            docker compose pull && docker compose up -d --remove-orphans
+                            curl -fsS --retry 15 --retry-delay 2 http://localhost:${APP_PORT}/health
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Approve production') {            // Block 20
+            agent none
+            when { allOf { beforeAgent true; branch 'main'; expression { params.DEPLOY_ENV == 'prod' } } }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    script {
+                        def approval = input(
+                            id: 'ProdDeploy',
+                            message: "Deploy ${IMAGE}:${env.GIT_SHA} to PRODUCTION?",
+                            ok: 'Ship it',
+                            submitter: 'release-managers,admins',
+                            submitterParameter: 'APPROVER'
+                        )
+                        env.APPROVER = approval['APPROVER']
+                        echo "Approved by ${env.APPROVER}"
+                    }
+                }
+            }
+        }
+
+        stage('Deploy · production') {           // Block 19 + 21
+            agent { label 'linux' }
+            when { allOf { branch 'main'; expression { params.DEPLOY_ENV == 'prod' } } }
+            steps {
+                lock(resource: 'deploy-prod') {          // one prod deploy at a time
+                    milestone 1                          // cancel older builds (Block 21)
+                    sshagent(credentials: ['deploy-key']) {
+                        sh """
+                            ssh -o StrictHostKeyChecking=no ubuntu@prod.example.com '
+                                set -e
+                                cd /opt/${APP_NAME}
+                                export IMAGE_REPO=${IMAGE} IMAGE_TAG=${GIT_SHA}
+                                docker compose pull && docker compose up -d --remove-orphans
+                                curl -fsS --retry 20 --retry-delay 3 http://localhost:${APP_PORT}/health
+                            '
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    post {                                       // Block 11
+        always {
+            dir(APP_NAME) {
+                junit testResults: 'reports/junit.xml', allowEmptyResults: true
+                recordCoverage tools: [[parser: 'COBERTURA', pattern: 'coverage/cobertura-coverage.xml']],
+                               sourceCodeRetention: 'LAST_BUILD'
+            }
+            archiveArtifacts artifacts: '**/reports/**,**/coverage/**,**/npm-audit.json,**/sbom.cdx.json',
+                             allowEmptyArchive: true, fingerprint: true
+        }
+        success   { echo "✅ ${IMAGE}:${env.GIT_SHA}" }
+        unstable  { echo "⚠️  Built, but quality gates were not met: ${env.BUILD_URL}" }
+        failure   { echo "❌ FAILED — ${env.BUILD_URL}" }
+        fixed     { echo "🎉 Back to green" }
+        regression{ echo "🔥 Regression — this branch used to pass" }
+        cleanup   {                               // Block 22: disk discipline
+            node('linux') {
+                sh 'docker image prune -f || true'
+                cleanWs()
+            }
+        }
+    }
+}

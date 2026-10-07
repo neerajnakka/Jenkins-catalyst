@@ -1,0 +1,282 @@
+<section class="block" id="block-8" data-block="8" data-title="Credentials &amp; secrets">
+    <div class="bhead"><div class="bnum">08</div><div>
+      <div class="bl">Block 8 · Real engineering</div>
+      <h2>Credentials &amp; secrets management</h2>
+      <p class="bgoal"><b>Goal:</b> never write a secret in a Jenkinsfile again — and be able to explain to an interviewer exactly how Jenkins stores, injects and masks them.</p>
+    </div></div>
+
+    <h3><span class="hn">8.1</span> How Jenkins stores credentials</h3>
+    <p>Credentials live in the credentials store at <span class="path">$JENKINS_HOME/secrets/</span>, <strong>encrypted</strong> with a master key (<span class="path">secrets/master.key</span> + <span class="path">secrets/hudson.util.Secret</span>). Pipelines never see the raw value in source — they reference an <strong>ID</strong> and Jenkins injects the value at runtime.</p>
+    <div class="warn"><span class="lbl"><span class="ic">⚠️</span>The disaster rule</span>
+    If you lose <span class="path">master.key</span>, every stored credential becomes permanently unreadable. Back it up <strong>separately</strong> from the rest of <code>JENKINS_HOME</code> — ideally outside the server. (Block 22.)</div>
+
+    <h3><span class="hn">8.2</span> Credential kinds — which to pick</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Kind</th><th>Holds</th><th>Typical ID</th><th>Used for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Username with password</strong></td><td>user + password/token</td><td><code>dockerhub-creds</code></td><td>Docker Hub, Artifactory, Git over HTTPS</td></tr>
+        <tr><td><strong>Secret text</strong></td><td>One string</td><td><code>sonar-token</code></td><td>API tokens, Slack token, Sonar token</td></tr>
+        <tr><td><strong>Secret file</strong></td><td>A whole file</td><td><code>kubeconfig</code></td><td>kubeconfig, <span class="path">.npmrc</span>, service-account JSON</td></tr>
+        <tr><td><strong>SSH Username with private key</strong></td><td>user + private key</td><td><code>github-ssh</code>, <code>deploy-key</code></td><td>Git over SSH, deploying over SSH</td></tr>
+        <tr><td><strong>Certificate</strong></td><td>Keystore / cert + password</td><td><code>signing-cert</code></td><td>Code signing, mTLS</td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>Scopes:</strong> <em>System</em> = only Jenkins itself can use it (safest, use for secrets). <em>Global</em> = also available to jobs. Store at the <strong>root</strong> for shared secrets, or inside a <strong>folder/domain</strong> so only that team's jobs can reach it (works beautifully with RBAC in Block 12).</p>
+
+    <h3><span class="hn">8.3</span> <code>withCredentials</code> — the injection block</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">All the binding forms you'll need</span><button class="copy">📋 Copy</button></div><pre><code>// 1. Username + password  ->  two env vars
+withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
+                                  usernameVariable: 'REG_USER',
+                                  passwordVariable: 'REG_PASS')]) {
+    sh 'docker login -u "$REG_USER" -p "$REG_PASS"'
+}
+
+// 2. Secret text  ->  one env var
+withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+    sh 'sonar-scanner -Dsonar.login=$SONAR_TOKEN'
+}
+
+// 3. Secret file  ->  env var holding a PATH to a temp copy (deleted afterwards)
+withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+    sh 'kubectl --kubeconfig=$KUBECONFIG get pods'
+}
+
+// 4. SSH key  ->  sshagent wrapper (safer than writing the key to disk)
+sshagent(['deploy-key']) {
+    sh 'ssh -o StrictHostKeyChecking=no ubuntu@host "docker pull app &amp;&amp; docker compose up -d"'
+}
+
+// 5. Several at once
+withCredentials([
+    usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'U', passwordVariable: 'P'),
+    string(credentialsId: 'slack-token', variable: 'SLACK')
+]) {
+    sh 'echo "using $U and $SLACK"'
+}</code></pre></div>
+
+    <h3><span class="hn">8.4</span> Masking — what Jenkins protects, and what it doesn't</h3>
+    <p>Jenkins replaces any occurrence of a bound secret's value in the console log with <code>****</code>. But masking is <em>string matching</em>, not magic.</p>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Masking behaviour — and the holes</span><button class="copy">📋 Copy</button></div><pre><code>withCredentials([string(credentialsId: 'my-token', variable: 'TOK')]) {
+    sh 'echo $TOK'            // ✅ printed as ****
+    sh 'echo "$TOK" | base64' // ❌ LEAKS -- base64 no longer matches the raw string
+    sh 'echo ${TOK:0:4}'      // ❌ LEAKS a substring
+    sh 'echo $TOK > out.txt'  // ⚠️  secret now sits in the workspace -> archive it and it's public
+    sh 'set +x; echo done'    // ✅ disable shell tracing around sensitive commands
+}</code></pre></div>
+    <div class="dang"><span class="lbl"><span class="ic">🚨</span>Secrets hygiene rules I follow</span>
+    <ul style="margin:0;padding-left:20px">
+      <li>One credential per purpose per environment — never one shared secret.</li>
+      <li>Name IDs predictably: <code>&lt;system&gt;-&lt;env&gt;-&lt;kind&gt;</code> e.g. <code>dockerhub-prod-push</code>.</li>
+      <li>Never <code>echo</code> a secret, even "just to debug" — and never write one to the workspace.</li>
+      <li>Rotate on a schedule and immediately after anyone with access leaves.</li>
+      <li>Prefer short-lived tokens (OIDC, IAM roles) over long-lived passwords where possible.</li>
+    </ul></div>
+
+    <h3><span class="hn">8.5</span> Where secrets must NOT live</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Anti-pattern</th><th>Why it's wrong</th><th>Do this instead</th></tr></thead>
+      <tbody>
+        <tr><td>Hard-coded in Jenkinsfile</td><td>Committed to Git; visible in every fork and clone</td><td>Credential ID + <code>withCredentials</code></td></tr>
+        <tr><td>In <code>environment {}</code> as plain text</td><td>Same problem, plus it's in the config</td><td><code>credentials('id')</code> helper</td></tr>
+        <tr><td>Global env var in Manage Jenkins</td><td>Readable by anyone who can configure jobs</td><td>Credentials store, folder-scoped</td></tr>
+        <tr><td>In a Docker image layer</td><td>Extractable by anyone who can pull the image</td><td>Build args only at runtime, or mount at run time</td></tr>
+        <tr><td>In a build parameter</td><td>Stored in plain text in build history</td><td>Credential, or a password-masked parameter at worst</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">8.6</span> ✍️ Jenkinsfiles v8 — secrets wired in</h3>
+    <div class="tabs">
+      <div class="tabbar">
+        <button class="tab on" data-t="n8">🟩 nodejs-app/Jenkinsfile</button>
+        <button class="tab" data-t="p8">🐍 python-app/Jenkinsfile</button>
+      </div>
+      <div class="tabpane on" data-t="n8">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">nodejs-app/Jenkinsfile — v8 (secrets)</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+    options { timestamps(); timeout(time: 20, unit: 'MINUTES') }
+
+    environment {
+        APP_NAME = 'nodejs-app'
+        // NOTE: no secrets here -- only IDs and non-sensitive config
+        REGISTRY_CREDENTIALS_ID = 'dockerhub-creds'
+    }
+
+    stages {
+        stage('Checkout') { steps { dir(APP_NAME) { checkout scmGit(
+                branches: [[name: '*/main']], extensions: [cleanBeforeCheckout()],
+                userRemoteConfigs: [[credentialsId: 'github-ssh',
+                    url: 'git@github.com:&lt;you&gt;/jenkins-zero-to-hero.git']]) } } }
+
+        stage('Build') { steps { dir(APP_NAME) { sh 'npm ci' } } }
+        stage('Test')  { steps { dir(APP_NAME) { sh 'npm run test:junit' } } }
+
+        stage('Verify registry access') {          // proving the credential works
+            steps {
+                withCredentials([usernamePassword(
+                        credentialsId: env.REGISTRY_CREDENTIALS_ID,
+                        usernameVariable: 'REG_USER',
+                        passwordVariable: 'REG_PASS')]) {
+                    sh '''
+                        set +x                          # never trace the login command
+                        echo "$REG_PASS" | docker login -u "$REG_USER" --password-stdin
+                        docker logout
+                    '''
+                    echo "Logged in as $REG_USER"        // username is not secret
+                }
+            }
+        }
+    }
+
+    post {
+        always { dir(APP_NAME) { junit testResults: 'reports/junit.xml', allowEmptyResults: true } }
+        cleanup { sh 'docker logout || true' }
+    }
+}</code></pre></div>
+      </div>
+      <div class="tabpane" data-t="p8">
+        <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">python-app/Jenkinsfile — v8 (secrets)</span><button class="copy">📋 Copy</button></div><pre><code>pipeline {
+    agent any
+    options { timestamps(); timeout(time: 20, unit: 'MINUTES') }
+
+    environment {
+        APP_NAME = 'python-app'
+        REGISTRY_CREDENTIALS_ID = 'dockerhub-creds'
+    }
+
+    stages {
+        stage('Checkout') { steps { dir(APP_NAME) { checkout scmGit(
+                branches: [[name: '*/main']], extensions: [cleanBeforeCheckout()],
+                userRemoteConfigs: [[credentialsId: 'github-ssh',
+                    url: 'git@github.com:&lt;you&gt;/jenkins-zero-to-hero.git']]) } } }
+
+        stage('Build') { steps { dir(APP_NAME) { sh '''
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install -r requirements-dev.txt
+                ''' } } }
+
+        stage('Test')  { steps { dir(APP_NAME) { sh '. venv/bin/activate &amp;&amp; pytest --cov-fail-under=70' } } }
+
+        stage('Verify registry access') {
+            steps {
+                withCredentials([usernamePassword(
+                        credentialsId: env.REGISTRY_CREDENTIALS_ID,
+                        usernameVariable: 'REG_USER',
+                        passwordVariable: 'REG_PASS')]) {
+                    sh '''
+                        set +x
+                        echo "$REG_PASS" | docker login -u "$REG_USER" --password-stdin
+                        docker logout
+                    '''
+                    echo "Logged in as $REG_USER"
+                }
+            }
+        }
+    }
+
+    post {
+        always { dir(APP_NAME) { junit testResults: 'reports/junit.xml', allowEmptyResults: true } }
+        cleanup { sh 'docker logout || true' }
+    }
+}</code></pre></div>
+      </div>
+    </div>
+    <div class="note"><span class="lbl"><span class="ic">🔑</span>Create the credential first</span>
+    Manage Jenkins → Credentials → System → <em>Global credentials</em> → Add Credentials → <strong>Username with password</strong> → Username: your Docker Hub user → Password: a Docker Hub <em>Access Token</em> (Account Settings → Security → New Access Token, not your account password) → ID: <code>dockerhub-creds</code>.</div>
+
+    <h3><span class="hn">8.7</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li><code>dockerhub-creds</code> exists and the "Verify registry access" stage is green.</li>
+      <li>I confirmed the password never appears in the console log.</li>
+      <li>I know where <span class="path">master.key</span> lives and why it matters.</li>
+      <li>No secret exists anywhere in either Jenkinsfile.</li>
+    </ul>
+
+    <h3><span class="hn">8.8</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>How do you manage secrets in Jenkins?</div><div class="a">In the credentials store, encrypted at rest with the master key, referenced by ID. I bind them at runtime with <code>withCredentials</code> (or the <code>credentials()</code> helper in <code>environment</code>), so the value only exists in the process environment for the duration of the block and is masked in the console. Nothing sensitive goes into the Jenkinsfile or into job parameters.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>How does Jenkins mask secrets, and what are the limits?</div><div class="a">It pattern-matches the secret's literal value in console output and replaces it with <code>****</code>. It only works for values Jenkins knows it bound — so transforming the secret (base64, substrings, writing it to a file) defeats masking. That's why I avoid transforming secrets and use <code>set +x</code> around sensitive shell commands.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>What happens if you lose <span class="path">master.key</span>?</div><div class="a">Every credential becomes permanently undecryptable — you must recreate them all. So I back up <span class="path">master.key</span> separately from <code>JENKINS_HOME</code> and treat it as the crown jewels.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>How would you give team A access to their secrets but not team B's?</div><div class="a">Put team A's jobs in a Jenkins <strong>folder</strong>, store the credentials in that folder's domain, and grant the team's role permissions only on that folder (Role Strategy plugin, Block 12). Credentials are then invisible and unusable outside it.</div></div>
+    </div>
+
+<h3><span class="hn">8.9</span> Under the hood — how credentials are protected</h3>
+<ol class="steps">
+  <li><strong>Storage.</strong> Credentials are stored in <span class="path">$JENKINS_HOME/credentials.xml</span> (metadata) with secret values encrypted using the key derived from <span class="path">secrets/master.key</span> and <span class="path">secrets/hudson.util.Secret</span>.</li>
+  <li><strong>Reference.</strong> A pipeline names an <strong>ID</strong>. At runtime the Credentials Provider API resolves that ID to an object — and access can be restricted by folder/domain.</li>
+  <li><strong>Binding.</strong> <code>withCredentials</code> writes the value into the environment of the steps inside it (or a temp file for <code>file()</code>), then removes it.</li>
+  <li><strong>Masking.</strong> Jenkins registers the plaintext value with the log filter, so any occurrence in console output is replaced with <code>****</code>.</li>
+</ol>
+<div class="dang"><span class="lbl"><span class="ic">🚨</span>What masking does NOT cover</span>
+<ul style="margin:0;padding-left:20px">
+<li>Transformed values: <code>base64</code>, substrings, reversed, URL-encoded.</li>
+<li>Values written into files that you then <code>archiveArtifacts</code> — the file is downloadable by anyone with read access.</li>
+<li>Values inside a <code>stash</code>, or baked into a Docker image layer.</li>
+<li>Values printed by a tool that buffers output differently (rare, but real with some CLIs).</li>
+</ul></div>
+
+<h3><span class="hn">8.10</span> Credential hygiene checklist for a real team</h3>
+<div class="tw"><table>
+<thead><tr><th>Rule</th><th>Implementation</th></tr></thead>
+<tbody>
+<tr><td>One credential per purpose per environment</td><td><code>dockerhub-prod-push</code>, <code>dockerhub-dev-push</code> — never one shared key</td></tr>
+<tr><td>Predictable IDs</td><td><code>&lt;system&gt;-&lt;env&gt;-&lt;purpose&gt;</code>; the ID is part of your codebase</td></tr>
+<tr><td>Least privilege</td><td>Docker Hub <em>access tokens</em> with only the scopes needed; read-only deploy keys</td></tr>
+<tr><td>Folder scoping</td><td>Credentials in the team's folder domain, invisible elsewhere</td></tr>
+<tr><td>Rotation</td><td>Quarterly, and immediately on any offboarding or suspected leak</td></tr>
+<tr><td>Prefer short-lived</td><td>OIDC / IAM roles / GitHub App tokens over long-lived passwords where possible</td></tr>
+<tr><td>Audit</td><td>Credentials plugin logs usage; the Audit Trail plugin records who created or changed them</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">8.11</span> Lab — see masking work, then defeat it</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 8.1 · Prove it yourself</span>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Run this once, then read the console output carefully</span><button class="copy">📋 Copy</button></div><pre><code>withCredentials([string(credentialsId: 'sonar-token', variable: 'SECRET')]) {
+    sh 'echo "raw      : $SECRET"'              // masked  -> raw      : ****
+    sh 'echo "base64   : $(echo -n $SECRET | base64)"'   // LEAKED (transformed)
+    sh 'echo "substring: ${SECRET:0:4}"'        // LEAKED (partial)
+    sh 'echo "$SECRET" &gt; secret.txt'            // written to the workspace!
+}
+// afterwards:
+sh 'cat secret.txt'                             // masked here too — but the FILE is archived below
+archiveArtifacts artifacts: 'secret.txt'        // anyone with read access can download it</code></pre></div>
+<strong>Takeaway:</strong> masking protects the console, not the artifact store. Never write a secret to the workspace, and never archive a file that contained one.</div>
+
+<h3><span class="hn">8.12</span> Creating credentials from code (JCasC / Groovy)</h3>
+<div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Script Console — add credentials programmatically (idempotent)</span><button class="copy">📋 Copy</button></div><pre><code>import com.cloudbees.plugins.credentials.*
+import com.cloudbees.plugins.credentials.common.*
+import com.cloudbees.plugins.credentials.domains.*
+import com.cloudbees.plugins.credentials.impl.*
+import org.jenkinsci.plugins.plaincredentials.impl.*
+import hudson.util.Secret
+
+def store = Jenkins.instance.getExtensionList(
+        'com.cloudbees.plugins.credentials.SystemCredentialsProvider')[0].getStore()
+def domain = Domain.global()
+
+def addIfMissing(id, cred) {
+    if (store.getCredentials(domain).any { it.id == id }) {
+        println "exists: ${id}"
+    } else {
+        store.addCredentials(domain, cred); println "added: ${id}"
+    }
+}
+
+addIfMissing('dockerhub-creds',
+    new UsernamePasswordCredentialsImpl(CredentialsScope.GLOBAL, 'dockerhub-creds',
+        'Docker Hub push token', 'your-user', 'dckr_pat_xxxxxxxxxxxx'))
+
+addIfMissing('sonar-token',
+    new StringCredentialsImpl(CredentialsScope.GLOBAL, 'sonar-token',
+        'SonarQube analysis token', Secret.fromString('squ_xxxxxxxxxxxx')))</code></pre></div>
+<div class="note"><span class="lbl"><span class="ic">📌</span>Prefer JCasC for this</span>
+Hard-coding secrets in a script is exactly what we're trying to avoid. In practice I put credentials in <span class="path">jenkins.yaml</span> with values injected from environment variables or a secret manager (see Block 22), and only use the script console for one-off recovery.</div>
+
+<h3><span class="hn">8.13</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q5</span>How would you migrate secrets from Jenkins to a vault (HashiCorp Vault / AWS Secrets Manager)?</div><div class="a">Install the matching credentials provider plugin so the vault appears as another credentials provider — pipelines keep using <code>credentialsId</code> and nothing in the Jenkinsfile changes. Then rotate each secret, move it to the vault, and delete the local copy. I'd do it incrementally per team to keep the blast radius small.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q6</span>What is a credentials domain?</div><div class="a">A scope within the credentials store. The global domain is visible everywhere; folder domains are visible only to items in that folder. Combined with folder-scoped roles, it's how you make secrets physically unreachable by other teams.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>Can a malicious Jenkinsfile read credentials?</div><div class="a">Yes, if it can run on the controller or use a credential in scope — which is exactly why Jenkinsfiles are code-reviewed, why shared libraries are access-controlled, and why credentials should be folder-scoped and least-privilege. On untrusted branches I restrict which credentials are available to that job.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>How do you rotate a credential without downtime?</div><div class="a">Create the new credential with a new ID, update the pipeline to read the new ID, deploy, verify, then delete the old one and revoke it at the provider. Having the ID in the Jenkinsfile (not the value) is what makes this a config change instead of an incident.</div></div>
+</div>
+</section>

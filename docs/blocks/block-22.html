@@ -1,0 +1,306 @@
+<section class="block" id="block-22" data-block="22" data-title="Backup, upgrade &amp; maintenance">
+    <div class="bhead"><div class="bnum">22</div><div>
+      <div class="bl">Block 22 · Operations &amp; interviews</div>
+      <h2>Backup, upgrade &amp; maintenance</h2>
+      <p class="bgoal"><b>Goal:</b> be the person who can restore Jenkins at 3 a.m. — and who can upgrade it without an outage. Operations knowledge is what turns a pipeline author into a platform engineer.</p>
+    </div></div>
+
+    <h3><span class="hn">22.1</span> What exactly to back up</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Item</th><th>Path</th><th>Critical?</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Job configuration</td><td><span class="path">$JENKINS_HOME/jobs/**/config.xml</span></td><td>🔴 Critical</td><td>Also in Git if you use JCasC</td></tr>
+        <tr><td>Global config</td><td><span class="path">$JENKINS_HOME/config.xml</span></td><td>🔴 Critical</td><td>Security settings, tool config</td></tr>
+        <tr><td>Credentials + master key</td><td><span class="path">$JENKINS_HOME/secrets/</span></td><td>🔴 Critical</td><td>Back up <span class="path">master.key</span> <strong>separately</strong></td></tr>
+        <tr><td>Plugin list</td><td><span class="path">plugins.txt</span> (yours)</td><td>🟡 Important</td><td>Reproducible rebuild</td></tr>
+        <tr><td>Jenkinsfiles</td><td>Your Git repos</td><td>🔴 Critical</td><td>Already versioned — the point of Pipeline as Code</td></tr>
+        <tr><td>Build history</td><td><span class="path">jobs/*/builds/</span></td><td>⚪ Nice</td><td>Huge; exclude from frequent backups</td></tr>
+        <tr><td>Workspaces</td><td><span class="path">workspace/</span></td><td>⚪ No</td><td>Recreated on next build — exclude</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">22.2</span> A backup script you can cron</h3>
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">scripts/jenkins-backup.sh</span><button class="copy">📋 Copy</button></div><pre><code>#!/usr/bin/env bash
+# Backs up the parts of JENKINS_HOME that matter, and nothing else.
+set -euo pipefail
+
+JENKINS_HOME="${JENKINS_HOME:-/var/lib/jenkins}"
+BACKUP_DIR="${BACKUP_DIR:-/var/backups/jenkins}"
+RETENTION_DAYS="${RETENTION_DAYS:-14}"
+STAMP=$(date +%Y%m%d-%H%M%S)
+OUT="${BACKUP_DIR}/jenkins-${STAMP}.tar.gz"
+
+mkdir -p "$BACKUP_DIR"
+
+# Quiesce: stop new builds while we copy, so nothing changes mid-backup
+sudo systemctl stop jenkins
+
+tar --exclude='jobs/*/builds/*/archive' \
+    --exclude='jobs/*/workspace*' \
+    --exclude='workspace/*' \
+    --exclude='caches/*' \
+    --exclude='logs/*' \
+    --exclude='tools/*' \
+    -czf "$OUT" -C "$JENKINS_HOME" .
+
+sudo systemctl start jenkins
+
+# The master key goes to a SEPARATE, more restricted location
+sudo cp "$JENKINS_HOME/secrets/master.key" "${BACKUP_DIR}/master.key-${STAMP}"
+sudo chmod 600 "${BACKUP_DIR}/master.key-${STAMP}"
+
+find "$BACKUP_DIR" -name 'jenkins-*.tar.gz' -mtime +$RETENTION_DAYS -delete
+echo "Backup written: $OUT ($(du -h "$OUT" | cut -f1))"</code></pre></div>
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">cron</span><span class="fn">Nightly at 02:15</span><button class="copy">📋 Copy</button></div><pre><code>15 2 * * * /home/ubuntu/jenkins-zero-to-hero/scripts/jenkins-backup.sh &gt;&gt; /var/log/jenkins-backup.log 2&gt;&amp;1</code></pre></div>
+    <div class="tip"><span class="lbl"><span class="ic">☁️</span>Off-box copies</span>
+    A backup on the same disk as Jenkins is not a backup. Sync to S3 afterwards: <code>aws s3 sync /var/backups/jenkins s3://your-bucket/jenkins/ --storage-class STANDARD_IA</code>, and turn on versioning + a lifecycle rule. The ThinBackup plugin can do all of this declaratively if you prefer UI-driven backups.</div>
+
+    <h3><span class="hn">22.3</span> Configuration as Code (JCasC) — the modern approach</h3>
+    <p>Instead of backing up XML and hoping, <strong>describe</strong> your controller in YAML. Install <strong>Configuration as Code</strong> (<code>configuration-as-code</code>), then <em>Manage Jenkins → System → Configuration as Code</em>:</p>
+    <div class="code" data-lang="yaml"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">yaml</span><span class="fn">jenkins/jenkins.yaml (JCasC)</span><button class="copy">📋 Copy</button></div><pre><code>jenkins:
+  systemMessage: "Managed by JCasC - do not edit by hand"
+  numExecutors: 0                     # controller runs no builds
+  securityRealm:
+    local:
+      users:
+        - id: "admin"
+          password: "${JENKINS_ADMIN_PASSWORD}"     # from an env var / secret
+  authorizationStrategy:
+    roleBased:
+      roles:
+        global:
+          - name: "admin"
+            permissions: ["Overall/Administer"]
+            assignments: ["admin"]
+  nodes:
+    - permanent:
+        name: "linux-1"
+        remoteFS: "/home/jenkins/agent"
+        numExecutors: 2
+        labelString: "linux docker node20"
+
+tool:
+  git:
+    installations:
+      - name: "Default"
+        home: "git"
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - usernamePassword:
+              id: "dockerhub-creds"
+              username: "your-user"
+              password: "${DOCKERHUB_TOKEN}"        # injected, never in Git
+
+unclassified:
+  sonarGlobalConfiguration:
+    installations:
+      - name: "sonar"
+        serverUrl: "http://localhost:9000"</code></pre></div>
+    <div class="info"><span class="lbl"><span class="ic">🚀</span>Why JCasC is a career multiplier</span>
+    Your controller becomes <strong>rebuildable from a file</strong>: new server, apply YAML, done. It's reviewable in PRs, testable, and the modern standard (often combined with the Jenkins Operator on Kubernetes). Mentioning "I manage Jenkins with JCasC + a plugin manifest" instantly signals platform-level thinking.</div>
+
+    <h3><span class="hn">22.4</span> Keeping the controller healthy</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Task</th><th>How</th><th>Frequency</th></tr></thead>
+      <tbody>
+        <tr><td>Discard old builds</td><td><code>buildDiscarder(logRotator(numToKeepStr:'30'))</code> per pipeline</td><td>Automatic</td></tr>
+        <tr><td>Clean workspaces</td><td><code>cleanWs()</code> in <code>post { cleanup }</code></td><td>Every build</td></tr>
+        <tr><td>Prune Docker</td><td><code>docker image/container/builder prune -f</code></td><td>Nightly cron</td></tr>
+        <tr><td>Rotate logs</td><td>logrotate on <span class="path">/var/log/jenkins/</span></td><td>Automatic</td></tr>
+        <tr><td>Update plugins</td><td>Manage Jenkins → Plugins → check <em>restart when idle</em></td><td>Monthly</td></tr>
+        <tr><td>Review users &amp; roles</td><td>Manage Jenkins → Manage and Assign Roles</td><td>Quarterly</td></tr>
+        <tr><td>Rotate credentials</td><td>Credentials → update tokens</td><td>Quarterly / on offboarding</td></tr>
+        <tr><td>Monitor</td><td>Prometheus plugin: queue length, executor usage, disk</td><td>Continuous</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3><span class="hn">22.5</span> Maintenance with the Script Console</h3>
+    <div class="code" data-lang="groovy"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">groovy</span><span class="fn">Manage Jenkins → Script Console (run with care)</span><button class="copy">📋 Copy</button></div><pre><code>// 1. Delete builds older than 30 days from every job
+import jenkins.model.Jenkins
+import java.util.Calendar
+
+def cutoff = Calendar.getInstance()
+cutoff.add(Calendar.DAY_OF_MONTH, -30)
+
+Jenkins.instance.allItems(hudson.model.Job).each { job -&gt;
+  job.builds.findAll { it.time &lt; cutoff.time }.each { build -&gt;
+    println "Deleting ${job.fullName} #${build.number}"
+    build.delete()
+  }
+}
+
+// 2. Find jobs that have never been built
+Jenkins.instance.allItems(hudson.model.Job).findAll { it.lastBuild == null }
+        .each { println "Never built: ${it.fullName}" }
+
+// 3. Which jobs are taking the longest?
+Jenkins.instance.allItems(hudson.model.Job).collect { job -&gt;
+  def b = job.lastBuild
+  [name: job.fullName, avg: job.builds.collect { it.duration }.with { it ? it.sum()/it.size() : 0 }]
+}.sort { -it.avg }.take(20).each { println "${it.name}: ${(it.avg/1000 as int)}s" }
+
+// 4. Reset a forgotten admin password
+def u = hudson.model.User.get('admin')
+u.addProperty(hudson.security.HudsonPrivateSecurityRealm.Details.fromPlainPassword('NewTempPass123!'))
+u.save()</code></pre></div>
+    <div class="dang"><span class="lbl"><span class="ic">🚨</span>The Script Console is root on Jenkins</span>
+    It executes Groovy with <strong>full controller privileges</strong> — including reading every credential. Restrict it with RBAC, never leave it open to non-admins, and always test scripts on a non-production controller first. Everything you run here is permanent.</div>
+
+    <h3><span class="hn">22.6</span> The upgrade procedure</h3>
+    <ol class="steps">
+      <li><strong>Read the changelog</strong> and the upgrade guide for your LTS line (e.g. 2.440 → 2.452). Note Java version requirements.</li>
+      <li><strong>Back up</strong> <code>JENKINS_HOME</code> and <span class="path">master.key</span>. Verify the archive opens.</li>
+      <li><strong>Update plugins first</strong>, on the old Jenkins version, and restart. Plugin incompatibilities are far more common than core problems.</li>
+      <li><strong>Upgrade core</strong>: <code>sudo apt update &amp;&amp; sudo apt install jenkins</code> (or swap the WAR / container image).</li>
+      <li><strong>Restart and verify</strong>: plugins loaded, agents reconnected, one pipeline from each app runs green.</li>
+      <li><strong>Rollback plan:</strong> keep the previous WAR/package and the backup; restore = stop, restore files, start.</li>
+    </ol>
+    <div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Find your version and check what's installed</span><button class="copy">📋 Copy</button></div><pre><code>java -jar /usr/share/jenkins/jenkins.war --version     # core version
+# or: Manage Jenkins -> About Jenkins
+
+# List installed plugins with versions (great for diffs)
+curl -s -u user:$TOKEN "http://localhost:8080/pluginManager/api/json?depth=1" \
+  | jq -r '.plugins[] | "\(.shortName) \(.version)"' | sort</code></pre></div>
+
+    <h3><span class="hn">22.7</span> ✅ Checklist</h3>
+    <ul class="check">
+      <li>Nightly backup job runs and you have <strong>restored</strong> from it at least once (untested backups don't count).</li>
+      <li><span class="path">master.key</span> is backed up separately.</li>
+      <li>Discard-old-builds + workspace cleanup + Docker pruning are all in place.</li>
+      <li>You can describe the six-step upgrade procedure without notes.</li>
+      <li>You have written (or at least read) a JCasC file.</li>
+    </ul>
+
+    <h3><span class="hn">22.8</span> 💬 Interview Q&amp;A</h3>
+    <div class="qawrap">
+      <div class="qa"><div class="q"><span class="qn">Q1</span>How do you back up Jenkins?</div><div class="a">I back up <code>JENKINS_HOME</code> excluding workspaces, build archives and caches, with Jenkins stopped briefly for consistency. <span class="path">secrets/master.key</span> is copied separately and tightly restricted, because without it credentials can never be decrypted. Copies go off-box to S3 with versioning, and I test the restore regularly — an untested backup isn't a backup.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q2</span>What's your upgrade process?</div><div class="a">Read the changelog and Java requirements, verify the backup, update plugins first (they cause most breakage), then upgrade core, restart, and smoke-test one pipeline per project. I keep the previous package and the backup so rollback is a file restore away.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q3</span>Jenkins is slow. Where do you look?</div><div class="a">Disk first (workspaces, Docker layers, build history), then the queue and executor usage, then memory and GC on the controller, then slow plugins (especially SCM scanning and heavy publishers). I add <code>buildDiscarder</code>, per-stage timeouts and the Timestamper plugin to find the specific slow stage.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q4</span>What is JCasC and why use it?</div><div class="a">Jenkins Configuration as Code: the entire controller configuration — security, tools, agents, credentials — described in YAML and loaded at startup. It makes the controller reproducible, reviewable in Git, and trivial to recreate after a disaster, which is a big step up from restoring XML blobs.</div></div>
+      <div class="qa"><div class="q"><span class="qn">Q5</span>How would you rebuild Jenkins from scratch after losing the server?</div><div class="a">Provision a box with the install script, restore the JENKINS_HOME backup (or apply the JCasC YAML plus the plugin manifest), restore <span class="path">master.key</span>, start Jenkins, verify agents reconnect, and run one pipeline per project. Because Jenkinsfiles live in Git, no pipeline logic was ever lost.</div></div>
+    </div>
+
+<h3><span class="hn">22.8</span> Under the hood — JCasC and immutability</h3>
+<p>Jenkins Configuration as Code reads a YAML file at start-up and reconciles it with the live configuration. Its value is not "config in a file" — it's that configuration becomes <strong>reviewable, diffable and reproducible</strong>.</p>
+<div class="code" data-lang="yaml"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">yaml</span><span class="fn">jenkins.yaml — a compact but real baseline</span><button class="copy">📋 Copy</button></div><pre><code>jenkins:
+  systemMessage: "Managed by JCasC - manual changes will be reverted on restart"
+  numExecutors: 0                       # never build on the controller
+  labelString: "built-in"
+  mode: EXCLUSIVE
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: "admin"
+          password: "${ADMIN_PASSWORD}"   # injected from the environment
+  authorizationStrategy:
+    roleBased:
+      roles:
+        global:
+          - name: "admin"
+            permissions:
+              - "Overall/Administer"
+            assignments:
+              - "admin"
+  nodes:
+    - permanent:
+        name: "linux-1"
+        remoteFS: "/home/jenkins/agent"
+        numExecutors: 4
+        labelString: "linux docker"
+        launcher:
+          ssh:
+            host: "10.0.1.20"
+            credentialsId: "agent-ssh"
+  tool:
+    git:
+      installations:
+        - name: "Default"
+          home: "git"
+security:
+  queueItemAuthenticator:
+    authenticators:
+      - global:
+          strategy: "triggeringUsersAuthorizationStrategy"
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - usernamePassword:
+              id: "dockerhub-creds"
+              username: "${DOCKER_USER}"
+              password: "${DOCKER_TOKEN}"
+              description: "Docker Hub push account"</code></pre></div>
+<div class="tip"><span class="lbl"><span class="ic">💡</span>Secrets in JCasC</span>
+Never commit real secrets: reference environment variables or files with <code>${VAR}</code> and supply them from your secret manager at boot. Manage Credentials is for runtime use; JCasC bootstraps the config around them.</div>
+
+<h3><span class="hn">22.9</span> Backup and disaster recovery</h3>
+<div class="tw"><table>
+<thead><tr><th>What</th><th>Why it matters</th><th>How often</th></tr></thead>
+<tbody>
+<tr><td><span class="path">$JENKINS_HOME</span> job configs</td><td>The jobs themselves</td><td>Daily</td></tr>
+<tr><td><span class="path">credentials.xml</span> + <code>master.key</code> / <code>hudson.util.Secret</code></td><td><strong>Without the key, credentials cannot be decrypted — the backup is useless</strong></td><td>Daily, encrypted, stored separately</td></tr>
+<tr><td>Plugin list</td><td>Reproducible install</td><td>On change</td></tr>
+<tr><td>Build history &amp; artifacts</td><td>Compliance, debugging</td><td>Weekly (or external storage only)</td></tr>
+</tbody>
+</table></div>
+<div class="dang"><span class="lbl"><span class="ic">🚨</span>The backup trap</span>
+Most teams back up <span class="path">$JENKINS_HOME</span> and forget <span class="path">master.key</span>, then discover during a restore that every credential is unreadable. Back up the key, encrypted, in a different location, and <strong>test a restore</strong> at least once.</div>
+<div class="code" data-lang="bash"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span class="lg">bash</span><span class="fn">Minimal, correct backup (ThinBackup-style, tar based)</span><button class="copy">📋 Copy</button></div><pre><code>#!/usr/bin/env bash
+set -euo pipefail
+STAMP=$(date +%F-%H%M)
+DEST=/backup/jenkins/$STAMP
+mkdir -p "$DEST"
+
+systemctl stop jenkins
+tar --exclude='*/workspace/*' \
+    --exclude='*/builds/*/archive/*' \
+    --exclude='caches' --exclude='logs' \
+    -czf "$DEST/jenkins-home.tgz" /var/lib/jenkins
+
+# The decryption key -- without it the backup CANNOT restore credentials
+cp /var/lib/jenkins/secrets/master.key "$DEST/" 2&gt;/dev/null || true
+cp /var/lib/jenkins/secrets/hudson.util.Secret "$DEST/" 2&gt;/dev/null || true
+systemctl start jenkins
+
+# Retention
+find /backup/jenkins -maxdepth 1 -mtime +14 -type d -exec rm -rf {} +
+echo "backup complete: $DEST"</code></pre></div>
+
+<h3><span class="hn">22.10</span> Lab — rebuild Jenkins from nothing</h3>
+<div class="lab"><span class="lbl"><span class="ic">🧪</span>Lab 22.1 · Prove you can recover</span>
+This is the exercise that turns "I configured Jenkins" into "I can operate Jenkins". Do it once, on a spare EC2 instance.
+<ol class="steps">
+<li><code>sudo systemctl stop jenkins</code> and move <span class="path">/var/lib/jenkins</span> aside.</li>
+<li>Install Jenkins fresh with <span class="path">jenkins/ec2-install.sh</span>.</li>
+<li>Restore <span class="path">jenkins.yaml</span> → start → confirm the controller comes back with your agents, users and roles.</li>
+<li>Restore <span class="path">credentials.xml</span> plus the key files → confirm a pipeline can still push to Docker Hub.</li>
+<li>Point a Multibranch job at your GitHub repo and press <em>Scan Repository Now</em> — all branches reappear without a single manual click.</li>
+</ol>
+Time it. If recovery takes more than about 30 minutes, automate more of it.</div>
+
+<h3><span class="hn">22.11</span> Observability for CI</h3>
+<div class="tw"><table>
+<thead><tr><th>Signal</th><th>How to get it</th><th>Why you care</th></tr></thead>
+<tbody>
+<tr><td>Build duration trend</td><td>Pipeline Timing plugin, or <code>currentBuild.duration</code> to a metrics sink</td><td>Slow creep is invisible day to day</td></tr>
+<tr><td>Success rate / flakiness</td><td>Build history + test trends</td><td>Flaky tests destroy trust in CI</td></tr>
+<tr><td>Queue depth and wait time</td><td>Monitoring plugin, Prometheus</td><td>Capacity problems show up here first</td></tr>
+<tr><td>Agent availability</td><td>Node monitors, Prometheus</td><td>Offline agents silently halve capacity</td></tr>
+<tr><td>Disk usage of <span class="path">$JENKINS_HOME</span></td><td>Node exporter / CloudWatch</td><td>Full disk = dead controller</td></tr>
+<tr><td>Security findings over time</td><td>Warnings NG trends, SonarQube history</td><td>Shows whether DevSecOps is working</td></tr>
+</tbody>
+</table></div>
+
+<h3><span class="hn">22.12</span> More interview Q&amp;A</h3>
+<div class="qawrap">
+  <div class="qa"><div class="q"><span class="qn">Q6</span>How do you manage Jenkins at scale?</div><div class="a">Configuration as Code for the controller, a pinned plugin list (or a pre-baked image), agents provisioned from images or Kubernetes, and pipelines plus shared libraries in Git. No manual configuration, no snowflake controller — I should be able to delete it and have it back within the hour.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q7</span>How do you test a Jenkins upgrade safely?</div><div class="a">Take a backup, restore it onto a staging controller, run a representative subset of jobs against it, and only then upgrade production — with a rollback path (AMI/snapshot) and a maintenance window. I read the plugin compatibility notes first, because plugin breakage is the usual failure mode, not Jenkins itself.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q8</span>How do you back up and restore Jenkins?</div><div class="a">ThinBackup or a scripted tar of <span class="path">$JENKINS_HOME</span> excluding workspaces and archived artifacts, <strong>including <span class="path">master.key</span></strong> so credentials remain decryptable, stored off the controller with retention. Restore is rehearsed, not assumed.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q9</span>How do you secure the controller itself?</div><div class="a">HTTPS with a real certificate, no anonymous access, matrix or role-based authorisation, CSRF protection on, agent-to-controller access control, zero executors on the built-in node, secrets only in the credential store, and the controller isolated so build agents can't reach it except through the remoting channel.</div></div>
+  <div class="qa"><div class="q"><span class="qn">Q10</span>How do you monitor Jenkins health?</div><div class="a">Prometheus metrics for queue depth, executor usage and build durations; alerts on agent offline, disk usage and queue backlog; plus trends for flaky tests and security findings. The goal is to notice degradation before developers start complaining.</div></div>
+</div>
+</section>
