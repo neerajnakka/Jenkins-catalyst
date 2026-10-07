@@ -1,4 +1,4 @@
-# 🚀 Jenkins Zero → Hero
+# 🚀 Jenkins God Mode
 
 **One repo · one document · 25 blocks.** Learn Jenkins the way it's actually used at work — by building two real services (Node.js + Python) and growing their pipelines block by block, from `echo "hello"` to a signed, scanned, deployed container.
 
